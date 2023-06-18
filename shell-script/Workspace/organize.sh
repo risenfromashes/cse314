@@ -146,6 +146,9 @@ for d in "$target_dir"/Python/*; do
 done
 
 for d in "$target_dir"/*/*; do
+  roll=${d##*/}
+  lang=${d%/*}
+  lang=${lang##*/}
   matched=0
   n=0
   for test in "$test_dir"/*; do
@@ -154,5 +157,6 @@ for d in "$target_dir"/*/*; do
     n=$((n + 1))
   done
   unmatched=$((n - matched))
+  echo $roll, $lang, $matched, $unmatched >> "$target_dir"/result.csv
 done
   
