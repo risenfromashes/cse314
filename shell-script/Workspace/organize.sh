@@ -13,7 +13,7 @@ filenames=("main.c" "Main.java" "main.py")
 for arg in "$@"; do
   if [[ $arg = "-v" ]]; then
       verbose=true
-  else if [[ $arg = "-noexecute" ]]; then
+  elif [[ $arg = "-noexecute" ]]; then
       exec=false
   fi
 done
@@ -136,7 +136,7 @@ if $exec; then
     compile "$d" $l
     for test in "$test_dir"/*; do
       i=$(get_test_no "$test")
-      run "$d" $lang "$test" "$d"/out$i.txt
+      run "$d" $l "$test" "$d"/out$i.txt
       matched=$((matched + $(match "$d" $i)))
     done
     unmatched=$((n_test - matched))
