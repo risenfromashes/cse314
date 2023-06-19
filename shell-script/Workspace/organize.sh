@@ -10,22 +10,39 @@ exts=("c" "java" "py")
 langs=("C" "Java" "Python")
 filenames=("main.c" "Main.java" "main.py")
 
+print_help(){
+  echo "Usage:" 
+  echo "/organize.sh <submission folder> <target folder> <test folder> <answer folder> [-v] [-noexecute]"; echo
+  echo "-v: verbose" 
+  echo "-noexecute: do not execute code files"
+  kill -INT $$
+}
+
+if [[ $# -lt 4 ]]; then
+  print_help
+fi
+
 for arg in "$@"; do
   if [[ $arg = "-v" ]]; then
       verbose=true
   elif [[ $arg = "-noexecute" ]]; then
       exec=false
+  elif [[ $arg = "-h" || $arg = "--help" ]]; then
+      print_help
   fi
 done
 
 if [[ ! -e "$sub_dir" ]]; then
   echo "Error, submission directory doesn't exist"
+  kill -INT $$
 fi
 if [[ ! -e "$test_dir" ]]; then
   echo "Error, test directory doesn't exist"
+  kill -INT $$
 fi
 if [[ ! -e "$ans_dir" ]]; then
   echo "Error, answer directory doesn't exist"
+  kill -INT $$
 fi
 
 if [[ ! -e "$target_dir" ]]; then
@@ -51,39 +68,31 @@ fi
 get_lang(){
   case $1 in
     c|C)
-      echo 0
-      ;;
+      echo 0;;
     java|Java)
-      echo 1
-      ;;
+      echo 1;;
     py|Python)
-      echo 2
-      ;;
+      echo 2;;
   esac
 }
 
 compile(){
   case "$2" in
     0)
-      gcc "$1"/main.c -o "$1"/main.out
-      ;;
+      gcc "$1"/main.c -o "$1"/main.out;;
     1)
-      javac "$1"/Main.java
-      ;;
+      javac "$1"/Main.java;;
   esac          
 }
 
 run(){
   case $2 in
     0)
-      "$1"/main.out < "$3" > "$4"
-      ;;
+      "$1"/main.out < "$3" > "$4";;
     1)
-      java -cp "$1" Main < "$3" > "$4"
-      ;;
+      java -cp "$1" Main < "$3" > "$4";;
     2)
-      python3 "$1"/main.py < "$3" > "$4"
-      ;;
+      python3 "$1"/main.py < "$3" > "$4";;
   esac
 }
 
@@ -97,6 +106,9 @@ process(){
   file=$1
   t=${file%.zip}
   roll=${t: -7}
+  if $verbose; then
+    echo Organizing files of $roll
+  fi
   unzip -jqq "$file" -d "$target_dir"/temp
   for f in "$target_dir"/temp/*; do
     ext=${f##*.}
@@ -132,6 +144,9 @@ if $exec; then
     lang=${d%/*}
     lang=${lang##*/}
     l=$(get_lang $lang)
+    if $verbose; then
+      echo Executing files of $roll
+    fi
     matched=0
     compile "$d" $l
     for test in "$test_dir"/*; do
