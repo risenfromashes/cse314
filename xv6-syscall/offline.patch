@@ -1,13 +1,14 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..b3663db 100644
+index 39a99d7..3b626b6 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -132,6 +132,8 @@ UPROGS=\
+@@ -132,6 +132,9 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
 +	$U/_trace\
 +	$U/_history\
++	$U/_exit\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
@@ -22,10 +23,10 @@ diff --git a/dataset.zip b/dataset.zip
 new file mode 100644
 index 0000000..e69de29
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..20fc3db 100644
+index a3c962b..7ecb160 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -8,182 +8,185 @@ struct spinlock;
+@@ -8,182 +8,186 @@ struct spinlock;
  struct sleeplock;
  struct stat;
  struct superblock;
@@ -206,6 +207,7 @@ index a3c962b..20fc3db 100644
 +void procdump(void);
 +int trace(int);
 +int history(int, uint64 addr);
++void timerhalt(void);
  
  // swtch.S
 -void            swtch(struct context*, struct context*);
@@ -345,6 +347,43 @@ index a3c962b..20fc3db 100644
  // number of elements in fixed-size array
 -#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
 +#define NELEM(x) (sizeof(x) / sizeof((x)[0]))
+diff --git a/kernel/kernelvec.S b/kernel/kernelvec.S
+index fb31b32..38440e6 100644
+--- a/kernel/kernelvec.S
++++ b/kernel/kernelvec.S
+@@ -97,12 +97,17 @@ timervec:
+         # scratch[0,8,16] : register save area.
+         # scratch[24] : address of CLINT's MTIMECMP register.
+         # scratch[32] : desired interval between interrupts.
++        # scratch[40] : halt flag set by timerhalt.
+         
+         csrrw a0, mscratch, a0
+         sd a1, 0(a0)
+         sd a2, 8(a0)
+         sd a3, 16(a0)
+ 
++        # halt if timerhalt has been set
++        ld a1, 40(a0)
++        bne a1, zero, halt
++
+         # schedule the next timer interrupt
+         # by adding interval to mtimecmp.
+         ld a1, 24(a0) # CLINT_MTIMECMP(hart)
+@@ -122,3 +127,14 @@ timervec:
+         csrrw a0, mscratch, a0
+ 
+         mret
++
++halt:
++        # based on qemu's hw/riscv/virt.c:
++        # qemu halts if FINISHER_PASS(=0x5555) is 
++        # written at address *VIRT_TEST(=0x100000L)
++        lui a1, 0x100
++        lui a2, 0x5
++        addi a2, a2, 0x555
++        sw a2, 0(a1)
++spin:
++        j spin
 diff --git a/kernel/main.c b/kernel/main.c
 index f0d3171..c8d08c5 100644
 --- a/kernel/main.c
@@ -383,6 +422,18 @@ index f0d3171..c8d08c5 100644
 -
 + 
    scheduler();        
+ }
+diff --git a/kernel/printf.c b/kernel/printf.c
+index 1a50203..7246eea 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -123,6 +123,7 @@ panic(char *s)
+   printf(s);
+   printf("\n");
+   panicked = 1; // freeze uart output from other CPUs
++  timerhalt();
+   for(;;)
+     ;
  }
 diff --git a/kernel/proc.c b/kernel/proc.c
 index 959b778..f5b62e9 100644
@@ -492,8 +543,45 @@ index d021857..ccd3980 100644
    char name[16];               // Process name (debugging)
 +  int sys_call_arg_types[7];   //.syscall argument types
  };
+diff --git a/kernel/start.c b/kernel/start.c
+index e16f18a..fa32556 100644
+--- a/kernel/start.c
++++ b/kernel/start.c
+@@ -11,7 +11,7 @@ void timerinit();
+ __attribute__ ((aligned (16))) char stack0[4096 * NCPU];
+ 
+ // a scratch area per CPU for machine-mode timer interrupts.
+-uint64 timer_scratch[NCPU][5];
++uint64 timer_scratch[NCPU][6];
+ 
+ // assembly code in kernelvec.S for machine-mode timer interrupt.
+ extern void timervec();
+@@ -73,9 +73,11 @@ timerinit()
+   // scratch[0..2] : space for timervec to save registers.
+   // scratch[3] : address of CLINT MTIMECMP register.
+   // scratch[4] : desired interval (in cycles) between timer interrupts.
++  // scratch[5] : to signal halt to timervec
+   uint64 *scratch = &timer_scratch[id][0];
+   scratch[3] = CLINT_MTIMECMP(id);
+   scratch[4] = interval;
++  scratch[5] = 0;
+   w_mscratch((uint64)scratch);
+ 
+   // set the machine-mode trap handler.
+@@ -87,3 +89,11 @@ timerinit()
+   // enable machine-mode timer interrupts.
+   w_mie(r_mie() | MIE_MTIE);
+ }
++
++// signal halt to timervec.
++void
++timerhalt()
++{
++  // set halt flag in scratch area for hartid[0] to 1.
++  timer_scratch[0][5] = 1;
++}
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index ed65409..45aa876 100644
+index ed65409..fe684cf 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
 @@ -6,6 +6,7 @@
@@ -536,12 +624,13 @@ index ed65409..45aa876 100644
    return fetchstr(addr, buf, max);
  }
  
-@@ -101,44 +106,160 @@ extern uint64 sys_unlink(void);
+@@ -101,44 +106,164 @@ extern uint64 sys_unlink(void);
  extern uint64 sys_link(void);
  extern uint64 sys_mkdir(void);
  extern uint64 sys_close(void);
 +extern uint64 sys_trace(void);
 +extern uint64 sys_history(void);
++extern uint64 sys_shutdown(void);
  
  // An array mapping syscall numbers from syscall.h
  // to the function that handles the system call.
@@ -589,7 +678,8 @@ index ed65409..45aa876 100644
 +[SYS_mkdir]     sys_mkdir,
 +[SYS_close]     sys_close,
 +[SYS_trace]     sys_trace,
-+[SYS_history]  sys_history,
++[SYS_history]   sys_history,
++[SYS_shutdown]  sys_shutdown,
 +};
 +
 +// an array of syscall names
@@ -617,6 +707,7 @@ index ed65409..45aa876 100644
 +[SYS_close]   "close",
 +[SYS_trace]   "trace",
 +[SYS_history] "history",
++[SYS_shutdown] "shutdown",
 +};
 +
 +struct syscall_stat syscall_histories[] = {
@@ -643,6 +734,7 @@ index ed65409..45aa876 100644
 +[SYS_close]   {"close", 0, 0},
 +[SYS_trace]   {"trace", 0, 0},
 +[SYS_history] {"history", 0, 0},
++[SYS_shutdown] {"shutdown", 0, 0}
  };
  
 +struct spinlock syscall_history_locks[N_SYS_CALL];
@@ -721,10 +813,10 @@ index ed65409..45aa876 100644
      printf("%d %s: unknown sys call %d\n",
              p->pid, p->name, num);
 diff --git a/kernel/syscall.h b/kernel/syscall.h
-index bc5f356..ba61575 100644
+index bc5f356..fafe694 100644
 --- a/kernel/syscall.h
 +++ b/kernel/syscall.h
-@@ -1,22 +1,30 @@
+@@ -1,22 +1,31 @@
  // System call numbers
 -#define SYS_fork    1
 -#define SYS_exit    2
@@ -767,8 +859,9 @@ index bc5f356..ba61575 100644
 +#define SYS_close 21
 +#define SYS_trace 22
 +#define SYS_history 23
++#define SYS_shutdown 24
 +
-+#define N_SYS_CALL 23
++#define N_SYS_CALL 24
 +
 +#define ARG_INT_T 1
 +#define ARG_PTR_T 2
@@ -786,10 +879,10 @@ index 0000000..efd5434
 +};
 \ No newline at end of file
 diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index 1de184e..dd722f9 100644
+index 1de184e..c745da6 100644
 --- a/kernel/sysproc.c
 +++ b/kernel/sysproc.c
-@@ -89,3 +89,21 @@ sys_uptime(void)
+@@ -89,3 +89,28 @@ sys_uptime(void)
    release(&tickslock);
    return xticks;
  }
@@ -810,6 +903,25 @@ index 1de184e..dd722f9 100644
 +  uint64 addr;
 +  argaddr(1, &addr);
 +  return history(call_id, addr);
++}
++
++
++// offline history
++uint64 sys_shutdown(void){
++  timerhalt();
++  return 0;
++}
+diff --git a/user/exit.c b/user/exit.c
+new file mode 100644
+index 0000000..8cbe908
+--- /dev/null
++++ b/user/exit.c
+@@ -0,0 +1,6 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(){
++	return shutdown();
 +}
 diff --git a/user/history.c b/user/history.c
 new file mode 100644
@@ -886,10 +998,10 @@ index 0000000..1555bcd
 +}
 +
 diff --git a/user/user.h b/user/user.h
-index 4d398d5..97e89b7 100644
+index 4d398d5..206c770 100644
 --- a/user/user.h
 +++ b/user/user.h
-@@ -1,41 +1,44 @@
+@@ -1,41 +1,45 @@
  struct stat;
 +struct syscall_stat;
  
@@ -930,6 +1042,7 @@ index 4d398d5..97e89b7 100644
  int uptime(void);
 +int trace(int);
 +int history(int, struct syscall_stat *stat);
++int shutdown(void);
  
  // ulib.c
 -int stat(const char*, struct stat*);
@@ -961,12 +1074,13 @@ index 4d398d5..97e89b7 100644
  int memcmp(const void *, const void *, uint);
  void *memcpy(void *, const void *, uint);
 diff --git a/user/usys.pl b/user/usys.pl
-index 01e426e..e2095e4 100755
+index 01e426e..db2bd3c 100755
 --- a/user/usys.pl
 +++ b/user/usys.pl
-@@ -36,3 +36,5 @@ entry("getpid");
+@@ -36,3 +36,6 @@ entry("getpid");
  entry("sbrk");
  entry("sleep");
  entry("uptime");
 +entry("trace");
 +entry("history");
++entry("shutdown");
