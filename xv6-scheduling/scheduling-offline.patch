@@ -1,0 +1,98 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..3accb48 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/random.o
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -132,6 +133,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_test\
++	$U/_dummyproc\
++	$U/_testprocinfo\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +157,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..9ec984e 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -185,5 +185,9 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++// random.c
++void            seed(uint64);
++uint64          random();
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..73549e2 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -1,13 +1,17 @@
+-#define NPROC        64  // maximum number of processes
+-#define NCPU          8  // maximum number of CPUs
+-#define NOFILE       16  // open files per process
+-#define NFILE       100  // open files per system
+-#define NINODE       50  // maximum number of active i-nodes
+-#define NDEV         10  // maximum major device number
+-#define ROOTDEV       1  // device number of file system root disk
+-#define MAXARG       32  // max exec arguments
+-#define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+-#define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+-#define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       2000  // size of file system in blocks
+-#define MAXPATH      128   // maximum file path name
++#define NPROC                64               // maximum number of processes
++#define NCPU                 8                // maximum number of CPUs
++#define NOFILE               16               // open files per process
++#define NFILE                100              // open files per system
++#define NINODE               50               // maximum number of active i-nodes
++#define NDEV                 10               // maximum major device number
++#define ROOTDEV              1                // device number of file system root disk
++#define MAXARG               32               // max exec arguments
++#define MAXOPBLOCKS          10               // max # of blocks any FS op writes
++#define LOGSIZE              (MAXOPBLOCKS*3)  // max data blocks in on-disk log
++#define NBUF                 (MAXOPBLOCKS*3)  // size of disk block cache
++#define FSSIZE               2000             // size of file system in blocks
++#define MAXPATH              128              // maximum file path name
++#define DEFAULT_TICKET_COUNT 10               // default ticket count for each process
++#define TIME_LIMIT_1         1                // queue 1 allocated time slice
++#define TIME_LIMIT_2         2                // queue 1 allocated time slice
++#define BOOST_INTERVAL       64               // interval between MLFQ boosting
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..b1adb20 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -91,6 +91,10 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  uint64 allocated_tickets;    // tickets to be allocated to this process
++  uint64 current_tickets;      // tickets currently left
++  int queue;                   // index of the queue in use
++  int time_slices;             // number of time slices used since scheduling
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
