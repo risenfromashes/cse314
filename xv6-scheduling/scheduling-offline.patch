@@ -31,6 +31,13 @@ index 39a99d7..3accb48 100644
  endif
  
  QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/compile_flags.txt b/compile_flags.txt
+new file mode 100644
+index 0000000..60a4aad
+--- /dev/null
++++ b/compile_flags.txt
+@@ -0,0 +1 @@
++-I.
 diff --git a/kernel/defs.h b/kernel/defs.h
 index a3c962b..9ec984e 100644
 --- a/kernel/defs.h
@@ -81,6 +88,45 @@ index 6624bff..73549e2 100644
 +#define TIME_LIMIT_2         2                // queue 1 allocated time slice
 +#define BOOST_INTERVAL       64               // interval between MLFQ boosting
 \ No newline at end of file
+diff --git a/kernel/pqueue.c b/kernel/pqueue.c
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/kernel/pqueue.c
+@@ -0,0 +1 @@
++
+diff --git a/kernel/pqueue.h b/kernel/pqueue.h
+new file mode 100644
+index 0000000..0464c4e
+--- /dev/null
++++ b/kernel/pqueue.h
+@@ -0,0 +1,26 @@
++#ifndef __PROC_QUEUE_H__
++#define __PROC_QUEUE_H__
++
++struct proc;
++
++enum pqueue_strategy {
++  PQUEUE_LOTTERY = 0,
++  PQUEUE_ROUND_ROBIN = 1
++};
++
++struct pnode {
++  struct proc *p;
++  int tickets;
++};
++
++struct pqueue {
++  struct pnode[NPROC];
++  int tail;
++  enum pqueue_strategy strategy;
++};
++
++struct pnode *pqueue_push(struct pqueue* q, struct proc *proc);
++struct pnode *pqueue_pop(struct pqueue* q);
++int pqueue_length();
++
++#endif
 diff --git a/kernel/proc.h b/kernel/proc.h
 index d021857..b1adb20 100644
 --- a/kernel/proc.h
@@ -96,3 +142,22 @@ index d021857..b1adb20 100644
  
    // wait_lock must be held when using this:
    struct proc *parent;         // Parent process
+diff --git a/kernel/random.c b/kernel/random.c
+new file mode 100644
+index 0000000..42ed3e7
+--- /dev/null
++++ b/kernel/random.c
+@@ -0,0 +1,12 @@
++#include "kernel/types.h"
++
++uint64 _seed = 1000;
++const uint64 A = 1103515245;
++const uint64 C = 12345;
++
++void seed(uint64 seed) { _seed = seed; }
++
++uint64 random() {
++  _seed = (A * _seed + C) & ((1u << 31) - 1);
++  return _seed;
++}
+\ No newline at end of file
