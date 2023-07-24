@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..10dd813 100644
+index 39a99d7..38fb490 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -28,7 +28,9 @@ OBJS = \
@@ -13,30 +13,28 @@ index 39a99d7..10dd813 100644
  
  # riscv64-unknown-elf- or riscv64-linux-gnu-
  # perhaps in /opt/riscv/bin
-@@ -132,6 +134,9 @@ UPROGS=\
+@@ -132,6 +134,8 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
-+	$U/_test\
 +	$U/_dummyproc\
 +	$U/_testprocinfo\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -153,7 +158,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
- 	then echo "-gdb tcp::$(GDBPORT)"; \
- 	else echo "-s -p $(GDBPORT)"; fi)
- ifndef CPUS
--CPUS := 3
-+CPUS := 1
- endif
- 
- QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..03c75fc 100644
+index a3c962b..b382d0f 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -106,6 +106,8 @@ void            yield(void);
+@@ -96,6 +96,7 @@ struct cpu*     mycpu(void);
+ struct cpu*     getmycpu(void);
+ struct proc*    myproc();
+ void            procinit(void);
++void            schedulerinit(void);
+ void            scheduler(void) __attribute__((noreturn));
+ void            sched(void);
+ void            sleep(void*, struct spinlock*);
+@@ -106,6 +107,8 @@ void            yield(void);
  int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
  int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
  void            procdump(void);
@@ -45,7 +43,7 @@ index a3c962b..03c75fc 100644
  
  // swtch.S
  void            swtch(struct context*, struct context*);
-@@ -185,5 +187,9 @@ void            virtio_disk_init(void);
+@@ -185,5 +188,9 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
@@ -55,6 +53,18 @@ index a3c962b..03c75fc 100644
 +
  // number of elements in fixed-size array
  #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..af5d67a 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -28,6 +28,7 @@ main()
+     iinit();         // inode table
+     fileinit();      // file table
+     virtio_disk_init(); // emulated hard disk
++    schedulerinit();  // scheduler queues must be initialised before first user process
+     userinit();      // first user process
+     __sync_synchronize();
+     started = 1;
 diff --git a/kernel/param.h b/kernel/param.h
 index 6624bff..2419f27 100644
 --- a/kernel/param.h
@@ -92,15 +102,17 @@ index 6624bff..2419f27 100644
 +#define TIME_LIMIT_2         2                // queue 1 allocated time slice
 +#define BOOST_INTERVAL       64               // interval between MLFQ boosting
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..5712afd 100644
+index 959b778..2acadde 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -5,11 +5,25 @@
+@@ -5,11 +5,27 @@
  #include "spinlock.h"
  #include "proc.h"
  #include "defs.h"
 +#include "pqueue.h"
 +#include "pstat.h"
++
++#include <stddef.h>
  
  struct cpu cpus[NCPU];
  
@@ -121,7 +133,7 @@ index 959b778..5712afd 100644
  struct proc *initproc;
  
  int nextpid = 1;
-@@ -146,6 +160,11 @@ found:
+@@ -146,6 +162,11 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
@@ -133,7 +145,7 @@ index 959b778..5712afd 100644
    return p;
  }
  
-@@ -169,6 +188,8 @@ freeproc(struct proc *p)
+@@ -169,6 +190,8 @@ freeproc(struct proc *p)
    p->killed = 0;
    p->xstate = 0;
    p->state = UNUSED;
@@ -142,7 +154,7 @@ index 959b778..5712afd 100644
  }
  
  // Create a user page table for a given process, with no user memory,
-@@ -296,6 +317,10 @@ fork(void)
+@@ -296,6 +319,10 @@ fork(void)
    }
    np->sz = p->sz;
  
@@ -153,54 +165,56 @@ index 959b778..5712afd 100644
    // copy saved user registers.
    *(np->trapframe) = *(p->trapframe);
  
-@@ -434,6 +459,8 @@ wait(uint64 addr)
+@@ -434,6 +461,16 @@ wait(uint64 addr)
    }
  }
  
 +volatile int scheduler_started = 0;
 +
++/* scheduler initialised */
++void schedulerinit(void) {
++  /* initialize queues */   
++  for(int i = 0; i < NQUEUE; i++) {
++    pqueue_init(&pqueues[i], pqueue_algorithms[i], pqueue_time_limits[i]);
++  }
++}
++
  // Per-CPU process scheduler.
  // Each CPU calls scheduler() after setting itself up.
  // Scheduler never returns.  It loops, doing:
-@@ -447,25 +474,73 @@ scheduler(void)
-   struct proc *p;
+@@ -444,28 +481,65 @@ wait(uint64 addr)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
    struct cpu *c = mycpu();
-   
+-  
 -  c->proc = 0;
 +  c->proc = NULL;
 +
-+  /* calling cpuid() requires interrupts to be disabled */
-+  intr_off();
-+  if (cpuid() == 0) {
-+    /* initialize queues */   
-+    for(int i = 0; i < NQUEUE; i++) {
-+      pqueue_init(&pqueues[i], pqueue_algorithms[i], pqueue_time_limits[i]);
-+    }
-+    scheduler_started = 0;
-+  } else {
-+    while (!scheduler_started);
-+  }
-+
    for(;;){
++    // printf("in scheduler main loop\n");
      // Avoid deadlock by ensuring that devices can interrupt.
      intr_on();
  
 -    for(p = proc; p < &proc[NPROC]; p++) {
-+    int time_limit;
-+    struct pqueue *next_queue;
-+    struct pqueue *prev_queue;
++    int time_limit = 0;
++    struct pqueue *next_queue = NULL;
++    struct pqueue *prev_queue = NULL;
++    struct proc *p = NULL;
 +
 +    for(int i = 0; i < NQUEUE; i++) {
 +      /* try to schedule from the top queue first */
-+      if ((p = pqueue_pop(&pqueues[i]))) {
-+        time_limit = pqueues[i].time_limit;
++      struct pqueue *q = &pqueues[i];
++      if ((p = pqueue_pop(q))) {
++        time_limit = q->time_limit;
 +        /* by default use current queue for if there is no prev or next queue */
-+        prev_queue = next_queue = &pqueues[i];
++        prev_queue = next_queue = q;
 +        if (i != 0) {
-+          prev_queue = &pqueues[i - 1];
++          prev_queue = q - 1;
 +        }
 +        if (i != (NQUEUE - 1)) {
-+          next_queue = &pqueues[i + 1];
++          next_queue = q + 1;
 +        }
 +        break;
 +      }
@@ -213,7 +227,7 @@ index 959b778..5712afd 100644
 +      /* remember initial time slices */
 +      uint64 t0 = p->time_slices;
 +
-+      while (p->state == RUNNABLE && ((p->time_slices - t0) <= time_limit)) {
++      while (p->state == RUNNABLE && ((p->time_slices - t0) < time_limit)) {
 +        /* yield to chosen process */
 +        p->state = RUNNING;
 +        c->proc = p;
@@ -244,7 +258,7 @@ index 959b778..5712afd 100644
        release(&p->lock);
      }
    }
-@@ -681,3 +756,41 @@ procdump(void)
+@@ -681,3 +755,41 @@ procdump(void)
      printf("\n");
    }
  }
@@ -452,7 +466,7 @@ index 1de184e..cb3b7e2 100644
 +  return getpinfo(addr);
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..07b91f7 100644
+index 512c850..5ce32fc 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
 @@ -5,12 +5,16 @@
@@ -472,7 +486,7 @@ index 512c850..07b91f7 100644
  // in kernelvec.S, calls kerneltrap().
  void kernelvec();
  
-@@ -167,6 +171,24 @@ clockintr()
+@@ -167,6 +171,25 @@ clockintr()
    ticks++;
    wakeup(&ticks);
    release(&tickslock);
@@ -490,6 +504,7 @@ index 512c850..07b91f7 100644
 +    struct proc* p = &proc[i];
 +    acquire(&p->lock);
 +    if (p->state == RUNNING) {
++      printf("RUNNING process found\n");
 +      p->time_slices++;
 +    }
 +    release(&p->lock);
@@ -497,21 +512,17 @@ index 512c850..07b91f7 100644
  }
  
  // check if it's an external interrupt or software interrupt,
-diff --git a/kernel/types.h b/kernel/types.h
-index ee73164..2cc465d 100644
---- a/kernel/types.h
-+++ b/kernel/types.h
-@@ -8,3 +8,5 @@ typedef unsigned int  uint32;
- typedef unsigned long uint64;
- 
- typedef uint64 pde_t;
-+
-+#define NULL (void *)0
 diff --git a/user/user.h b/user/user.h
-index 4d398d5..1d299b7 100644
+index 4d398d5..b5ef267 100644
 --- a/user/user.h
 +++ b/user/user.h
-@@ -22,6 +22,8 @@ int getpid(void);
+@@ -1,4 +1,5 @@
+ struct stat;
++struct pstat;
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +23,8 @@ int getpid(void);
  char* sbrk(int);
  int sleep(int);
  int uptime(void);
