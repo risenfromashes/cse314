@@ -1,18 +1,19 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..3accb48 100644
+index 39a99d7..10dd813 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -28,7 +28,8 @@ OBJS = \
+@@ -28,7 +28,9 @@ OBJS = \
    $K/sysfile.o \
    $K/kernelvec.o \
    $K/plic.o \
 -  $K/virtio_disk.o
 +  $K/virtio_disk.o \
-+  $K/random.o
++  $K/random.o \
++  $K/pqueue.o
  
  # riscv64-unknown-elf- or riscv64-linux-gnu-
  # perhaps in /opt/riscv/bin
-@@ -132,6 +133,9 @@ UPROGS=\
+@@ -132,6 +134,9 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
@@ -22,7 +23,7 @@ index 39a99d7..3accb48 100644
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -153,7 +157,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+@@ -153,7 +158,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
  	then echo "-gdb tcp::$(GDBPORT)"; \
  	else echo "-s -p $(GDBPORT)"; fi)
  ifndef CPUS
@@ -31,18 +32,20 @@ index 39a99d7..3accb48 100644
  endif
  
  QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
-diff --git a/compile_flags.txt b/compile_flags.txt
-new file mode 100644
-index 0000000..60a4aad
---- /dev/null
-+++ b/compile_flags.txt
-@@ -0,0 +1 @@
-+-I.
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..9ec984e 100644
+index a3c962b..03c75fc 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -185,5 +185,9 @@ void            virtio_disk_init(void);
+@@ -106,6 +106,8 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             settickets(int);
++int             getpinfo(uint64);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -185,5 +187,9 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
@@ -88,237 +91,16 @@ index 6624bff..2419f27 100644
 +#define TIME_LIMIT_1         1                // queue 1 allocated time slice
 +#define TIME_LIMIT_2         2                // queue 1 allocated time slice
 +#define BOOST_INTERVAL       64               // interval between MLFQ boosting
-diff --git a/kernel/pqueue.c b/kernel/pqueue.c
-new file mode 100644
-index 0000000..7f77f06
---- /dev/null
-+++ b/kernel/pqueue.c
-@@ -0,0 +1,167 @@
-+#include "param.h"
-+#include "types.h"
-+#include "memlayout.h"
-+#include "spinlock.h"
-+#include "riscv.h"
-+#include "proc.h"
-+#include "pqueue.h"
-+#include "defs.h"
-+
-+#define INC(x) ((x + PQUEUE_CAPACITY + 1) % PQUEUE_CAPACITY)
-+#define DEC(x) ((x + PQUEUE_CAPACITY - 1) % PQUEUE_CAPACITY)
-+
-+extern struct proc proc[NPROC];
-+
-+static int pqueue_round_robin_select(struct pqueue *q) {
-+  for (int i = q->head; i != q->tail; q->tail = INC(q->tail)) {
-+    struct proc* p = q->procs[i];
-+    acquire(&p->lock);
-+    if (p->state == RUNNABLE) {
-+      /* select first runnable process */
-+      release(&p->lock);
-+      return i;
-+    }
-+    release(&p->lock);
-+  }
-+  return -1;
-+}
-+
-+static int pqueue_lottery_select(struct pqueue *q) {
-+  /* get total tickets */
-+  uint64 total_tickets = 0;
-+  for (int i = q->head; i != q->tail; q->tail = INC(q->tail)) {
-+    struct proc* p = q->procs[i];
-+    acquire(&p->lock);
-+    /* only consider processes that are runnable */
-+    if (p->state == RUNNABLE) {
-+      total_tickets += p->tickets;
-+    }
-+    release(&p->lock);
-+  }
-+
-+  /* generate random number */
-+  uint64 r = random() % total_tickets;
-+
-+  for (int i = q->head; i != q->tail; q->tail = INC(q->tail)) {
-+    struct proc* p = q->procs[i];
-+    acquire(&p->lock);
-+    if (p->state == RUNNABLE) {
-+      if(p->tickets < r) {
-+        /* falls in range */
-+        release(&p->lock);
-+        return i;
-+      } else {
-+        r -= p->tickets;
-+      }
-+    }
-+    release(&p->lock);
-+  }
-+
-+  /* this path is only taken when a process changes state from runnable to something else 
-+   * between counting total tickets and checking ticket count again.
-+   * which shouldn't be possible since lock on the queue is held, so no other cpu will
-+   * schedule it? */
-+  return -1;
-+}
-+
-+int (*pqueue_selectors[])(struct pqueue* q) = {
-+  [PQUEUE_ROUND_ROBIN] = pqueue_round_robin_select, 
-+  [PQUEUE_LOTTERY] = pqueue_lottery_select
-+};
-+
-+void pqueue_init(struct pqueue* q, enum pqueue_algorithm alg, int time_limit) {
-+  initlock(&q->lock, "pqueue lock");
-+  q->head = q->tail = 0;
-+  q->strategy = alg;
-+  q->time_limit = time_limit;
-+}
-+
-+void pqueue_push(struct pqueue* q, struct proc *p){
-+  acquire(&q->lock);
-+  if (q->head == INC(q->tail)) {
-+    panic("Attemping to push into full queue");
-+  }
-+
-+
-+  q->procs[q->tail] = p;
-+  q->tail = INC(q->tail);
-+
-+  release(&q->lock);
-+
-+  acquire(&p->lock);
-+  p->queue = q;
-+  release(&p->lock);
-+}
-+
-+struct proc* pqueue_pop(struct pqueue *q) {
-+  acquire(&q->lock);
-+  if (pqueue_empty(q)) {
-+    panic("Attempting to pop from empty queue");
-+  }
-+
-+  int t = pqueue_selectors[q->strategy](q);
-+
-+  if(t == -1) {
-+    /* no suitable candidate to pop */
-+    /* very rare case? should happen when all processes sleep for some reason */
-+    release(&q->lock);
-+    return NULL;
-+  }
-+
-+  /* swap head with popped proc */
-+  struct proc* ret = q->procs[t];
-+  q->procs[t] = q->procs[q->head];
-+  q->head = INC(q->head);
-+  release(&q->lock);
-+
-+  /* popped from queue */
-+  acquire(&ret->lock);
-+  ret->queue = NULL;
-+  release(&ret->lock);
-+
-+  return ret;
-+}
-+
-+
-+int pqueue_empty(struct pqueue* q) {
-+  acquire(&q->lock);
-+  int ret = q->head == q->tail;
-+  acquire(&q->lock);
-+  return ret;
-+}
-+
-+
-+void pqueue_boost(struct pqueue* q) {
-+  acquire(&q->lock);
-+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
-+    acquire(&p->lock);
-+
-+    if (p->state == UNUSED) {
-+      release(&p->lock);
-+      continue;
-+    }
-+
-+    /* running process must not be in the queue */
-+    if (p->state == RUNNING && p->queue) {
-+      panic("Running process found in queue");
-+    }
-+
-+    /* steal from other queue */
-+    struct pqueue* q2 = p->queue;
-+    release(&p->lock);
-+
-+    if (q == q2) {
-+      continue;
-+    }
-+
-+    /* modifying q2, so lock must be held */
-+    acquire(&q2->lock);
-+    for (int i = q2->head; i != q2->tail; q2->tail = INC(q2->tail)) {
-+      pqueue_push(q, q2->procs[i]);
-+    }
-+    /* clear q2 */
-+    q2->head = q2->tail = 0;
-+    release(&q2->lock);
-+  }
-+  release(&q->lock);
-+}
-diff --git a/kernel/pqueue.h b/kernel/pqueue.h
-new file mode 100644
-index 0000000..317eca5
---- /dev/null
-+++ b/kernel/pqueue.h
-@@ -0,0 +1,43 @@
-+#ifndef __PROC_QUEUE_H__
-+#define __PROC_QUEUE_H__
-+
-+
-+#define PQUEUE_CAPACITY (NPROC + 1)
-+
-+enum pqueue_algorithm {
-+  PQUEUE_ROUND_ROBIN = 0,
-+  PQUEUE_LOTTERY = 1,
-+};
-+
-+struct pqueue {
-+  /* lock needs to be held for all queue operations */
-+  struct spinlock lock;
-+  /* the processes currently in the queue */
-+  struct proc* procs[PQUEUE_CAPACITY];
-+  /* circular queue of length (tail - head) */
-+  /* tail indicates end of queue */
-+  int head;
-+  int tail;
-+  /* strategy used to pop element from queue */
-+  enum pqueue_algorithm strategy;
-+  /* time limit for processes scheduled from this queue */
-+  int time_limit;
-+};
-+
-+/* initialize the queue */
-+void pqueue_init(struct pqueue* q, enum pqueue_algorithm strategy, int time_limit);
-+
-+/* push process at the tail of this queue */
-+void pqueue_push(struct pqueue* q, struct proc *proc);
-+
-+/* pop runnable process according to scheduling algorithm */
-+struct proc* pqueue_pop(struct pqueue* q);
-+
-+/* checks whether queue is empty */
-+int pqueue_empty(struct pqueue* q);
-+
-+
-+/* boost all procs to target queue */
-+void pqueue_boost(struct pqueue* q);
-+
-+#endif
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..b4e9c83 100644
+index 959b778..5712afd 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -5,11 +5,24 @@
+@@ -5,11 +5,25 @@
  #include "spinlock.h"
  #include "proc.h"
  #include "defs.h"
 +#include "pqueue.h"
++#include "pstat.h"
  
  struct cpu cpus[NCPU];
  
@@ -339,18 +121,19 @@ index 959b778..b4e9c83 100644
  struct proc *initproc;
  
  int nextpid = 1;
-@@ -146,6 +159,10 @@ found:
+@@ -146,6 +160,11 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
 +  p->tickets = p->initial_tickets = DEFAULT_TICKET_COUNT;
-+  p->queue = NULL;
 +  p->time_slices = 0;
++
++  pqueue_push(&pqueues[0], p);
 +
    return p;
  }
  
-@@ -169,6 +186,8 @@ freeproc(struct proc *p)
+@@ -169,6 +188,8 @@ freeproc(struct proc *p)
    p->killed = 0;
    p->xstate = 0;
    p->state = UNUSED;
@@ -359,7 +142,7 @@ index 959b778..b4e9c83 100644
  }
  
  // Create a user page table for a given process, with no user memory,
-@@ -296,6 +315,10 @@ fork(void)
+@@ -296,6 +317,10 @@ fork(void)
    }
    np->sz = p->sz;
  
@@ -370,7 +153,16 @@ index 959b778..b4e9c83 100644
    // copy saved user registers.
    *(np->trapframe) = *(p->trapframe);
  
-@@ -447,10 +470,50 @@ scheduler(void)
+@@ -434,6 +459,8 @@ wait(uint64 addr)
+   }
+ }
+ 
++volatile int scheduler_started = 0;
++
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+@@ -447,25 +474,73 @@ scheduler(void)
    struct proc *p;
    struct cpu *c = mycpu();
    
@@ -384,23 +176,39 @@ index 959b778..b4e9c83 100644
 +    for(int i = 0; i < NQUEUE; i++) {
 +      pqueue_init(&pqueues[i], pqueue_algorithms[i], pqueue_time_limits[i]);
 +    }
++    scheduler_started = 0;
++  } else {
++    while (!scheduler_started);
 +  }
 +
    for(;;){
      // Avoid deadlock by ensuring that devices can interrupt.
      intr_on();
-+    int time_limit = 0;
+ 
+-    for(p = proc; p < &proc[NPROC]; p++) {
++    int time_limit;
++    struct pqueue *next_queue;
++    struct pqueue *prev_queue;
 +
 +    for(int i = 0; i < NQUEUE; i++) {
 +      /* try to schedule from the top queue first */
 +      if ((p = pqueue_pop(&pqueues[i]))) {
 +        time_limit = pqueues[i].time_limit;
++        /* by default use current queue for if there is no prev or next queue */
++        prev_queue = next_queue = &pqueues[i];
++        if (i != 0) {
++          prev_queue = &pqueues[i - 1];
++        }
++        if (i != (NQUEUE - 1)) {
++          next_queue = &pqueues[i + 1];
++        }
 +        break;
 +      }
 +    }
 +
 +    if (p) {
-+      acquire(&p->lock);
+       acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
 +
 +      /* remember initial time slices */
 +      uint64 t0 = p->time_slices;
@@ -409,21 +217,77 @@ index 959b778..b4e9c83 100644
 +        /* yield to chosen process */
 +        p->state = RUNNING;
 +        c->proc = p;
-+        swtch(&c->context, &p->context);
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+         swtch(&c->context, &p->context);
 +      }
-+
-+      /* still runnable, must have finished time slot */
-+      if (p->state == RUNNABLE) {
-+        //TODO
-+      }
-+
-+      release(&p->lock);
-+    }
  
-     for(p = proc; p < &proc[NPROC]; p++) {
-       acquire(&p->lock);
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
++      // Process is done running for now.
++      // It should have changed its p->state before coming back.
++      c->proc = NULL;
++      if (p->state == RUNNABLE) {
++        /* still runnable, must have finished time slot */
++        /* insert to next lower level queue */
++        pqueue_push(next_queue, p);
++      } else if (p->state == SLEEPING) {
++        /* voluntarily relinquished cpu */
++        /* insert to prev higher level queue */
++        pqueue_push(prev_queue, p);
+       }
++
+       release(&p->lock);
+     }
+   }
+@@ -681,3 +756,41 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++
++
++int
++settickets(int tickets) {
++  struct proc *p = myproc();
++  /* process is running so no need to lock */
++  p->initial_tickets = p->tickets = tickets;
++  return 0;
++}
++
++int
++getpinfo(uint64 addr) {
++  struct pstat stat;
++
++  for(int i = 0; i < NPROC; i++) {
++    struct proc *p = &proc[i];
++    acquire(&p->lock);
++    stat.pid[i] = p->pid;
++    stat.inuse[i] = p->state == RUNNING || p->state == RUNNABLE;
++    if (p->queue) {
++      stat.inQ[i] = p->queue - &pqueues[0] + 1;
++    } else {
++      stat.inQ[i] = 0;
++    }
++    stat.tickets_current[i] = p->tickets;
++    stat.tickets_original[i] = p->initial_tickets;
++    stat.time_slices[i] = p->time_slices;
++    release(&p->lock);
++  }
++
++  struct proc *p = myproc();
++
++  if(copyout(p->pagetable, addr, (char *)&stat, sizeof(struct pstat)) != 0) {
++    return -1;
++  }
++  return 0;
++}
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..e3f1fc6 100644
+index d021857..53e0c1d 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
 @@ -81,6 +81,8 @@ struct trapframe {
@@ -435,37 +299,158 @@ index d021857..e3f1fc6 100644
  // Per-process state
  struct proc {
    struct spinlock lock;
-@@ -92,6 +94,11 @@ struct proc {
+@@ -92,6 +94,9 @@ struct proc {
    int xstate;                  // Exit status to be returned to parent's wait
    int pid;                     // Process ID
  
-+  uint64 initial_tickets;      // tickets to be allocated to this process
-+  uint64 tickets;              // tickets currently left
 +  struct pqueue *queue;        // index of the queue in use
 +  int time_slices;             // number of time slices used since scheduling
 +
    // wait_lock must be held when using this:
    struct proc *parent;         // Parent process
  
-diff --git a/kernel/random.c b/kernel/random.c
-new file mode 100644
-index 0000000..57977f3
---- /dev/null
-+++ b/kernel/random.c
-@@ -0,0 +1,12 @@
-+#include "kernel/types.h"
+@@ -104,4 +109,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
 +
-+uint64 _seed = 7;
-+const uint64 A = 1103515245;
-+const uint64 C = 12345;
++  uint64 initial_tickets;      // tickets to be allocated to this process
++  uint64 tickets;              // tickets currently left
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..ee8ec2a 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,31 +101,35 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_settickets(void);
++extern uint64 sys_getpinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+ static uint64 (*syscalls[])(void) = {
+-[SYS_fork]    sys_fork,
+-[SYS_exit]    sys_exit,
+-[SYS_wait]    sys_wait,
+-[SYS_pipe]    sys_pipe,
+-[SYS_read]    sys_read,
+-[SYS_kill]    sys_kill,
+-[SYS_exec]    sys_exec,
+-[SYS_fstat]   sys_fstat,
+-[SYS_chdir]   sys_chdir,
+-[SYS_dup]     sys_dup,
+-[SYS_getpid]  sys_getpid,
+-[SYS_sbrk]    sys_sbrk,
+-[SYS_sleep]   sys_sleep,
+-[SYS_uptime]  sys_uptime,
+-[SYS_open]    sys_open,
+-[SYS_write]   sys_write,
+-[SYS_mknod]   sys_mknod,
+-[SYS_unlink]  sys_unlink,
+-[SYS_link]    sys_link,
+-[SYS_mkdir]   sys_mkdir,
+-[SYS_close]   sys_close,
++[SYS_fork]       = sys_fork,
++[SYS_exit]       = sys_exit,
++[SYS_wait]       = sys_wait,
++[SYS_pipe]       = sys_pipe,
++[SYS_read]       = sys_read,
++[SYS_kill]       = sys_kill,
++[SYS_exec]       = sys_exec,
++[SYS_fstat]      = sys_fstat,
++[SYS_chdir]      = sys_chdir,
++[SYS_dup]        = sys_dup,
++[SYS_getpid]     = sys_getpid,
++[SYS_sbrk]       = sys_sbrk,
++[SYS_sleep]      = sys_sleep,
++[SYS_uptime]     = sys_uptime,
++[SYS_open]       = sys_open,
++[SYS_write]      = sys_write,
++[SYS_mknod]      = sys_mknod,
++[SYS_unlink]     = sys_unlink,
++[SYS_link]       = sys_link,
++[SYS_mkdir]      = sys_mkdir,
++[SYS_close]      = sys_close,
++[SYS_settickets] = sys_settickets,
++[SYS_getpinfo]   = sys_getpinfo,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..44fa9b5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -1,22 +1,24 @@
+ // System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++#define SYS_fork        1
++#define SYS_exit        2
++#define SYS_wait        3
++#define SYS_pipe        4
++#define SYS_read        5
++#define SYS_kill        6
++#define SYS_exec        7
++#define SYS_fstat       8
++#define SYS_chdir       9
++#define SYS_dup        10
++#define SYS_getpid     11
++#define SYS_sbrk       12
++#define SYS_sleep      13
++#define SYS_uptime     14
++#define SYS_open       15
++#define SYS_write      16
++#define SYS_mknod      17
++#define SYS_unlink     18
++#define SYS_link       19
++#define SYS_mkdir      20
++#define SYS_close      21
++#define SYS_settickets 22
++#define SYS_getpinfo   23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..cb3b7e2 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,18 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
 +
-+void seed(uint64 seed) { _seed = seed; }
-+
-+uint64 random() {
-+  _seed = (A * _seed + C) & ((1u << 31) - 1);
-+  return _seed;
++uint64
++sys_settickets(void) {
++  int tickets;
++  argint(0, &tickets);
++  return settickets(tickets);
 +}
-\ No newline at end of file
++
++
++uint64
++sys_getpinfo(void) {
++  uint64 addr;
++  argaddr(0, &addr);
++  return getpinfo(addr);
++}
 diff --git a/kernel/trap.c b/kernel/trap.c
 index 512c850..07b91f7 100644
 --- a/kernel/trap.c
@@ -522,3 +507,26 @@ index ee73164..2cc465d 100644
  typedef uint64 pde_t;
 +
 +#define NULL (void *)0
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..1d299b7 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int settickets(int);
++int getpinfo(struct pstat *);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d2435c1 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("settickets");
++entry("getpinfo");
