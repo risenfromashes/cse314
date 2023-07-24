@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..38fb490 100644
+index 39a99d7..af95b21 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -28,7 +28,9 @@ OBJS = \
@@ -22,6 +22,15 @@ index 39a99d7..38fb490 100644
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +157,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 8
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
 diff --git a/compile_flags.txt b/compile_flags.txt
 new file mode 100644
 index 0000000..60a4aad
@@ -110,10 +119,10 @@ index 6624bff..2419f27 100644
 +#define BOOST_INTERVAL       64               // interval between MLFQ boosting
 diff --git a/kernel/pqueue.c b/kernel/pqueue.c
 new file mode 100644
-index 0000000..32d7001
+index 0000000..ea546e5
 --- /dev/null
 +++ b/kernel/pqueue.c
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,192 @@
 +#include "param.h"
 +#include "types.h"
 +#include "memlayout.h"
@@ -189,11 +198,7 @@ index 0000000..32d7001
 +    }
 +    release(&p->lock);
 +  }
-+
-+  /* this path is only taken when a process changes state from runnable to something else 
-+   * between counting total tickets and checking ticket count again.
-+   * which shouldn't be possible since lock on the queue is held, so no other cpu will
-+   * schedule it? */
++  /* there is no runnable process in queue */
 +  return -1;
 +}
 +
@@ -270,7 +275,6 @@ index 0000000..32d7001
 +
 +
 +void pqueue_boost(struct pqueue* q) {
-+  acquire(&q->lock);
 +  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
 +    acquire(&p->lock);
 +
@@ -280,9 +284,14 @@ index 0000000..32d7001
 +    }
 +
 +    /* running processes aren't boosted */
-+    if (p->state == UNUSED || p->state == RUNNING) {
++    /* and of course zombie processes aren't boosted :clown */
++    if (p->state == UNUSED || p->state == RUNNING || p->state == ZOMBIE) {
 +      release(&p->lock);
 +      continue;
++    }
++
++    if (!p->queue) {
++      panic("null pqueue for used process");
 +    }
 +
 +
@@ -305,7 +314,6 @@ index 0000000..32d7001
 +    q2->head = q2->tail = 0;
 +    release(&q2->lock);
 +  }
-+  release(&q->lock);
 +}
 diff --git a/kernel/pqueue.h b/kernel/pqueue.h
 new file mode 100644
@@ -357,7 +365,7 @@ index 0000000..ed72622
 +
 +#endif
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..2acadde 100644
+index 959b778..b13715d 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -5,11 +5,27 @@
@@ -448,7 +456,6 @@ index 959b778..2acadde 100644
 +  c->proc = NULL;
 +
    for(;;){
-+    // printf("in scheduler main loop\n");
      // Avoid deadlock by ensuring that devices can interrupt.
      intr_on();
  
@@ -492,6 +499,7 @@ index 959b778..2acadde 100644
 -        p->state = RUNNING;
 -        c->proc = p;
          swtch(&c->context, &p->context);
++        p->time_slices++;
 +      }
  
 -        // Process is done running for now.
@@ -588,13 +596,14 @@ index d021857..53e0c1d 100644
  };
 diff --git a/kernel/pstat.h b/kernel/pstat.h
 new file mode 100644
-index 0000000..67306f0
+index 0000000..f13660c
 --- /dev/null
 +++ b/kernel/pstat.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +#ifndef _PSTAT_H_
 +#define _PSTAT_H_
 +#include "param.h"
++
 +
 +struct pstat {
 +  int pid[NPROC]; // the process ID of each process 
@@ -761,7 +770,7 @@ index 1de184e..cb3b7e2 100644
 +  return getpinfo(addr);
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..5ce32fc 100644
+index 512c850..96a2cbe 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
 @@ -5,12 +5,16 @@
@@ -781,7 +790,7 @@ index 512c850..5ce32fc 100644
  // in kernelvec.S, calls kerneltrap().
  void kernelvec();
  
-@@ -167,6 +171,25 @@ clockintr()
+@@ -167,6 +171,14 @@ clockintr()
    ticks++;
    wakeup(&ticks);
    release(&tickslock);
@@ -793,58 +802,51 @@ index 512c850..5ce32fc 100644
 +    t = 0;    
 +    pqueue_boost(&pqueues[0]);
 +  }
-+
-+  /* increase time_slice for every running processes */
-+  for(int i = 0; i < NPROC; i++) {
-+    struct proc* p = &proc[i];
-+    acquire(&p->lock);
-+    if (p->state == RUNNING) {
-+      printf("RUNNING process found\n");
-+      p->time_slices++;
-+    }
-+    release(&p->lock);
-+  }
  }
  
  // check if it's an external interrupt or software interrupt,
 diff --git a/user/dummyproc.c b/user/dummyproc.c
 new file mode 100644
-index 0000000..1479a9a
+index 0000000..8843ffd
 --- /dev/null
 +++ b/user/dummyproc.c
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,37 @@
 +#include "kernel/types.h"
 +#include "kernel/stat.h"
 +#include "user/user.h"
 +
 +int main(int argc, char **argv) {
-+	if (argc <= 1) {
-+		printf("Usage:\n");
-+		printf("settickets <ticket count>\r");
-+		return 1;
-+	}
-+	
-+	int tickets = atoi(argv[1]);
-+	if(settickets(tickets) != 0) {
-+		printf("setticket failed\n");
-+		return 1;
-+	}
++  if (argc <= 1) {
++    printf("Usage:\n");
++    printf("settickets <ticket count>\n");
++    return 1;
++  }
 +
-+	for(int i = 0; i < 4; i++) {
-+		fork();
-+	}
++  int tickets = atoi(argv[1]);
++  if (settickets(tickets) != 0) {
++    printf("setticket failed\n");
++    return 1;
++  }
 +
-+	/* dummy calculation */
-+	int dummy[10];
-+	for(int i = 0; i < 1e7; i++) {
-+		dummy[i % 10] = (dummy[i % 10] + i) % 10;
-+	}
++  /* dummy calculation */
++  int dummy[10];
++  int itr = 2e8;
++  int nfork = 5;
 +
-+	if(dummy[0]) {
-+		printf("");
-+	}
++  for (int i = 0, k = 0; i < itr; i++) {
++    if (i >= (k * itr / nfork)) {
++      /* distribute forks evenly */
++      fork();
++      k++;
++    }
++    dummy[i % 10] = (dummy[i % 10] + i) % 10;
++  }
 +
-+	return 0;
++  if (dummy[0]) {
++    printf("");
++  }
++
++  return 0;
 +}
 diff --git a/user/testprocinfo.c b/user/testprocinfo.c
 new file mode 100644
