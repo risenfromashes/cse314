@@ -22,6 +22,13 @@ index 39a99d7..38fb490 100644
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/compile_flags.txt b/compile_flags.txt
+new file mode 100644
+index 0000000..60a4aad
+--- /dev/null
++++ b/compile_flags.txt
+@@ -0,0 +1 @@
++-I.
 diff --git a/kernel/defs.h b/kernel/defs.h
 index a3c962b..b382d0f 100644
 --- a/kernel/defs.h
@@ -101,6 +108,254 @@ index 6624bff..2419f27 100644
 +#define TIME_LIMIT_1         1                // queue 1 allocated time slice
 +#define TIME_LIMIT_2         2                // queue 1 allocated time slice
 +#define BOOST_INTERVAL       64               // interval between MLFQ boosting
+diff --git a/kernel/pqueue.c b/kernel/pqueue.c
+new file mode 100644
+index 0000000..32d7001
+--- /dev/null
++++ b/kernel/pqueue.c
+@@ -0,0 +1,193 @@
++#include "param.h"
++#include "types.h"
++#include "memlayout.h"
++#include "spinlock.h"
++#include "riscv.h"
++#include "proc.h"
++#include "pqueue.h"
++#include "defs.h"
++
++#include <stddef.h>
++
++#define INC(x) ((x + PQUEUE_CAPACITY + 1) % PQUEUE_CAPACITY)
++#define DEC(x) ((x + PQUEUE_CAPACITY - 1) % PQUEUE_CAPACITY)
++
++extern struct proc proc[NPROC];
++
++static int pqueue_round_robin_select(struct pqueue *q) {
++  for (int i = q->head; i != q->tail; i = INC(i)) {
++    struct proc* p = q->procs[i];
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      /* select first runnable process */
++      release(&p->lock);
++      return i;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++static int pqueue_lottery_select(struct pqueue *q) {
++  /* get total tickets */
++  uint64 total_tickets = 0;
++  for (int i = q->head; i != q->tail; i = INC(i)) {
++    struct proc* p = q->procs[i];
++    acquire(&p->lock);
++    /* only consider processes that are runnable */
++    if (p->state == RUNNABLE) {
++      total_tickets += p->tickets;
++    }
++    release(&p->lock);
++  }
++
++  if (total_tickets == 0) {
++    for (int i = q->head; i != q->tail; i = INC(i)) {
++      struct proc* p = q->procs[i];
++      acquire(&p->lock);
++      /* only consider processes that are runnable */
++      if (p->state == RUNNABLE) {
++        p->tickets = p->initial_tickets;
++      }
++      release(&p->lock);
++    }
++
++    return -1;
++  }
++
++  /* generate random number */
++  uint64 r = random() % total_tickets;
++
++  for (int i = q->head; i != q->tail; i = INC(i)) {
++    struct proc* p = q->procs[i];
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      if(r < p->tickets) {
++        /* falls in range */
++        p->tickets--;
++        release(&p->lock);
++        return i;
++      } else {
++        r -= p->tickets;
++      }
++    }
++    release(&p->lock);
++  }
++
++  /* this path is only taken when a process changes state from runnable to something else 
++   * between counting total tickets and checking ticket count again.
++   * which shouldn't be possible since lock on the queue is held, so no other cpu will
++   * schedule it? */
++  return -1;
++}
++
++int (*pqueue_selectors[])(struct pqueue* q) = {
++  [PQUEUE_ROUND_ROBIN] = pqueue_round_robin_select, 
++  [PQUEUE_LOTTERY] = pqueue_lottery_select
++};
++
++void pqueue_init(struct pqueue *q, enum pqueue_algorithm alg, int time_limit) {
++  initlock(&q->lock, "pqueue lock");
++  q->head = q->tail = 0;
++  q->strategy = alg;
++  q->time_limit = time_limit;
++}
++
++void pqueue_push(struct pqueue* q, struct proc *p){
++  acquire(&q->lock);
++  if (q->head == INC(q->tail)) {
++    panic("Attemping to push into full queue");
++  }
++
++
++  q->procs[q->tail] = p;
++  q->tail = INC(q->tail);
++  release(&q->lock);
++
++  if(!holding(&p->lock)) {
++    panic("Lock not held on p while attempting to push to queue");
++  }
++
++  p->queue = q;
++}
++
++struct proc* pqueue_pop(struct pqueue *q) {
++  acquire(&q->lock);
++
++  if (q->head == q->tail) {
++    /* empty queue */
++    release(&q->lock);
++    return NULL;
++  }
++
++  int t = pqueue_selectors[q->strategy](q);
++
++
++  if(t == -1) {
++    /* no suitable candidate to pop */
++    /* very rare case? should happen when all processes sleep for some reason */
++    release(&q->lock);
++    return NULL;
++  }
++
++  /* swap head with popped proc */
++  struct proc* ret = q->procs[t];
++  q->procs[t] = q->procs[q->head];
++  q->head = INC(q->head);
++  release(&q->lock);
++
++  /* popped from queue */
++  acquire(&ret->lock);
++  ret->queue = NULL;
++  release(&ret->lock);
++
++  return ret;
++}
++
++
++int pqueue_empty(struct pqueue* q) {
++  acquire(&q->lock);
++  int ret = q->head == q->tail;
++  acquire(&q->lock);
++  return ret;
++}
++
++
++void pqueue_boost(struct pqueue* q) {
++  acquire(&q->lock);
++  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++
++    /* running process must not be in any queue */
++    if (p->state == RUNNING && p->queue) {
++      panic("Running process found in queue");
++    }
++
++    /* running processes aren't boosted */
++    if (p->state == UNUSED || p->state == RUNNING) {
++      release(&p->lock);
++      continue;
++    }
++
++
++    /* steal from other queue */
++    struct pqueue* q2 = p->queue;
++    release(&p->lock);
++
++    if (q == q2) {
++      continue;
++    }
++
++    /* modifying q2, so lock must be held */
++    acquire(&q2->lock);
++    for (int i = q2->head; i != q2->tail; i = INC(i)) {
++      acquire(&q2->procs[i]->lock);
++      pqueue_push(q, q2->procs[i]);
++      release(&q2->procs[i]->lock);
++    }
++    /* clear q2 */
++    q2->head = q2->tail = 0;
++    release(&q2->lock);
++  }
++  release(&q->lock);
++}
+diff --git a/kernel/pqueue.h b/kernel/pqueue.h
+new file mode 100644
+index 0000000..ed72622
+--- /dev/null
++++ b/kernel/pqueue.h
+@@ -0,0 +1,43 @@
++#ifndef __PROC_QUEUE_H__
++#define __PROC_QUEUE_H__
++
++
++#define PQUEUE_CAPACITY (NPROC + 1)
++
++enum pqueue_algorithm {
++  PQUEUE_ROUND_ROBIN = 0,
++  PQUEUE_LOTTERY = 1,
++};
++
++struct pqueue {
++  /* lock needs to be held for all queue operations */
++  struct spinlock lock;
++  /* the processes currently in the queue */
++  struct proc* procs[PQUEUE_CAPACITY];
++  /* circular queue of length (tail - head) */
++  /* tail indicates end of queue */
++  int head;
++  int tail;
++  /* strategy used to pop element from queue */
++  enum pqueue_algorithm strategy;
++  /* time limit for processes scheduled from this queue */
++  int time_limit;
++};
++
++/* initialize the queue */
++void pqueue_init(struct pqueue* q, enum pqueue_algorithm strategy, int time_limit);
++
++/* push proc into the queue, proc lock must be held */
++void pqueue_push(struct pqueue* q, struct proc *proc);
++
++/* pop runnable process according to scheduling algorithm */
++struct proc* pqueue_pop(struct pqueue* q);
++
++/* checks whether queue is empty */
++int pqueue_empty(struct pqueue* q);
++
++
++/* boost all procs to target queue */
++void pqueue_boost(struct pqueue* q);
++
++#endif
 diff --git a/kernel/proc.c b/kernel/proc.c
 index 959b778..2acadde 100644
 --- a/kernel/proc.c
@@ -331,6 +586,46 @@ index d021857..53e0c1d 100644
 +  uint64 initial_tickets;      // tickets to be allocated to this process
 +  uint64 tickets;              // tickets currently left
  };
+diff --git a/kernel/pstat.h b/kernel/pstat.h
+new file mode 100644
+index 0000000..67306f0
+--- /dev/null
++++ b/kernel/pstat.h
+@@ -0,0 +1,15 @@
++#ifndef _PSTAT_H_
++#define _PSTAT_H_
++#include "param.h"
++
++struct pstat {
++  int pid[NPROC]; // the process ID of each process 
++  int inuse[NPROC]; // whether this slot of the process table is being used (1 or 0)
++  int inQ[NPROC]; // which queue the process is currently in 
++  int tickets_original[NPROC]; // the number of tickets each process originally had
++  int tickets_current[NPROC]; // the number of tickets each process currently has
++  int time_slices[NPROC]; // the number of time slices each process has been scheduled
++};
++
++#endif // _PSTAT_H_
++
+diff --git a/kernel/random.c b/kernel/random.c
+new file mode 100644
+index 0000000..57977f3
+--- /dev/null
++++ b/kernel/random.c
+@@ -0,0 +1,12 @@
++#include "kernel/types.h"
++
++uint64 _seed = 7;
++const uint64 A = 1103515245;
++const uint64 C = 12345;
++
++void seed(uint64 seed) { _seed = seed; }
++
++uint64 random() {
++  _seed = (A * _seed + C) & ((1u << 31) - 1);
++  return _seed;
++}
+\ No newline at end of file
 diff --git a/kernel/syscall.c b/kernel/syscall.c
 index ed65409..ee8ec2a 100644
 --- a/kernel/syscall.c
@@ -512,6 +807,82 @@ index 512c850..5ce32fc 100644
  }
  
  // check if it's an external interrupt or software interrupt,
+diff --git a/user/dummyproc.c b/user/dummyproc.c
+new file mode 100644
+index 0000000..1479a9a
+--- /dev/null
++++ b/user/dummyproc.c
+@@ -0,0 +1,33 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main(int argc, char **argv) {
++	if (argc <= 1) {
++		printf("Usage:\n");
++		printf("settickets <ticket count>\r");
++		return 1;
++	}
++	
++	int tickets = atoi(argv[1]);
++	if(settickets(tickets) != 0) {
++		printf("setticket failed\n");
++		return 1;
++	}
++
++	for(int i = 0; i < 4; i++) {
++		fork();
++	}
++
++	/* dummy calculation */
++	int dummy[10];
++	for(int i = 0; i < 1e7; i++) {
++		dummy[i % 10] = (dummy[i % 10] + i) % 10;
++	}
++
++	if(dummy[0]) {
++		printf("");
++	}
++
++	return 0;
++}
+diff --git a/user/testprocinfo.c b/user/testprocinfo.c
+new file mode 100644
+index 0000000..35c1df9
+--- /dev/null
++++ b/user/testprocinfo.c
+@@ -0,0 +1,31 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/pstat.h"
++#include "user/user.h"
++
++
++int main(int argc, char **argv) {
++	struct pstat stat;
++
++	if (getpinfo(&stat) < 0) {
++		printf("%s: exec failed\n", argv[0]);
++		return 1;
++	}
++		
++	printf("PID\t|\tIn Use\t|\tinQ\t|\tOriginal Tickets\t|\tCurrent Tickets\t|\tTime Slices\n");
++
++  for (int i = 0; i < NPROC; i++) {
++    if (stat.pid[i] == 0) {
++			continue;
++		}
++    printf("%d\t\t%d\t\t%d\t\t%d\t\t\t\t%d\t\t\t%d\n", 
++			stat.pid[i], 
++			stat.inuse[i], 
++			stat.inQ[i], 
++			stat.tickets_original[i], 
++			stat.tickets_current[i], 
++			stat.time_slices[i]);
++  }
++
++	return 0;
++}
 diff --git a/user/user.h b/user/user.h
 index 4d398d5..b5ef267 100644
 --- a/user/user.h
