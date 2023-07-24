@@ -807,46 +807,42 @@ index 512c850..96a2cbe 100644
  // check if it's an external interrupt or software interrupt,
 diff --git a/user/dummyproc.c b/user/dummyproc.c
 new file mode 100644
-index 0000000..8843ffd
+index 0000000..5473cee
 --- /dev/null
 +++ b/user/dummyproc.c
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,33 @@
 +#include "kernel/types.h"
 +#include "kernel/stat.h"
 +#include "user/user.h"
 +
 +int main(int argc, char **argv) {
-+  if (argc <= 1) {
-+    printf("Usage:\n");
-+    printf("settickets <ticket count>\n");
-+    return 1;
-+  }
++	if (argc <= 1) {
++		printf("Usage:\n");
++		printf("settickets <ticket count>\n");
++		return 1;
++	}
++	
++	int tickets = atoi(argv[1]);
++	if(settickets(tickets) != 0) {
++		printf("setticket failed\n");
++		return 1;
++	}
 +
-+  int tickets = atoi(argv[1]);
-+  if (settickets(tickets) != 0) {
-+    printf("setticket failed\n");
-+    return 1;
-+  }
++	for(int i = 0; i < 4; i++) {
++		fork();
++	}
 +
-+  /* dummy calculation */
-+  int dummy[10];
-+  int itr = 2e8;
-+  int nfork = 5;
++	/* dummy calculation */
++	int dummy[10];
++	for(int i = 0; i < 1e8; i++) {
++		dummy[i % 10] = (dummy[i % 10] + i) % 10;
++	}
 +
-+  for (int i = 0, k = 0; i < itr; i++) {
-+    if (i >= (k * itr / nfork)) {
-+      /* distribute forks evenly */
-+      fork();
-+      k++;
-+    }
-+    dummy[i % 10] = (dummy[i % 10] + i) % 10;
-+  }
++	if(dummy[0]) {
++		printf("");
++	}
 +
-+  if (dummy[0]) {
-+    printf("");
-+  }
-+
-+  return 0;
++	return 0;
 +}
 diff --git a/user/testprocinfo.c b/user/testprocinfo.c
 new file mode 100644
