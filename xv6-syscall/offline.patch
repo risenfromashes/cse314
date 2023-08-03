@@ -581,7 +581,7 @@ index e16f18a..fa32556 100644
 +  timer_scratch[0][5] = 1;
 +}
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index ed65409..fe684cf 100644
+index ed65409..b3cda4d 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
 @@ -6,6 +6,7 @@
@@ -801,7 +801,7 @@ index ed65409..fe684cf 100644
 +    int t1 = ticks;
 +    release(&tickslock);
 +
-+    syscall_histories[num].accum_time += (t1 - t0);
++    syscall_histories[num].accum_time += (t1 - t0) / 10;
 +    syscall_histories[num].count++;
 +
 +    if (num == p->trace_call_id){
