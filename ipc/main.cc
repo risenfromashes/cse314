@@ -1,4 +1,5 @@
 #include "binding_stations.h"
+#include "config.h"
 #include "entry_book.h"
 #include "group.h"
 #include "printing_station.h"
@@ -7,6 +8,7 @@
 #include "student.h"
 #include "timer.h"
 
+#include <cassert>
 #include <iostream>
 
 int main() {
@@ -19,11 +21,16 @@ int main() {
   std::cin >> n >> m;
   std::cin >> w >> x >> y;
 
-  std::vector<std::shared_ptr<Student>> students(n);
-  std::vector<std::shared_ptr<Staff>> staffs(2);
-  std::vector<std::shared_ptr<Group>> groups(n / m);
-  std::vector<std::shared_ptr<PrintingStation>> printing_stations(4);
+  Config::set_w(w);
+  Config::set_x(x);
+  Config::set_y(y);
 
+  std::vector<std::shared_ptr<Student>> students(n);
+  std::vector<std::shared_ptr<Group>> groups(n / m);
+
+  std::vector<std::shared_ptr<Staff>> staffs(2);
+
+  std::vector<std::shared_ptr<PrintingStation>> printing_stations(4);
   std::shared_ptr<BindingStations> binding_stations =
       std::make_shared<BindingStations>(2);
   std::shared_ptr<EntryBook> entry_book = std::make_shared<EntryBook>();
@@ -39,24 +46,29 @@ int main() {
     students[i - 1]->set_entry_book(entry_book);
   }
 
-  for (int gid = 1; gid <= m; gid++) {
+  for (int gid = 1; gid <= (n / m); gid++) {
     // create group and set leader
     groups[gid - 1] = std::make_shared<Group>(gid);
-    groups[gid - 1]->set_leader(students[gid * m]);
+    groups[gid - 1]->set_leader(students[gid * m - 1]);
     // add members
     for (int sid = (gid - 1) * m + 1; sid <= gid * m; sid++) {
-      groups[gid - 1]->add_member(students[sid]);
+      groups[gid - 1]->add_member(students[sid - 1]);
     }
+    assert(students[gid * m - 1]->is_leader());
   }
 
-  for (int i = 0; i < n; i++) {
+  for (int i = 1; i <= n; i++) {
     students[i - 1]->start();
   }
 
   for (int i = 1; i <= 2; i++) {
     staffs[i - 1] = std::make_shared<Staff>(i);
+    staffs[i - 1]->set_entry_book(entry_book);
     staffs[i - 1]->start();
   }
+
+  join(students);
+  join(staffs);
 
   return 0;
 }

@@ -1,5 +1,6 @@
 #include "random.h"
 #include <cstdint>
+#include <iostream>
 #include <random>
 
 void Random::init() {
@@ -9,5 +10,6 @@ void Random::init() {
 
 uint32_t Random::get() {
   std::scoped_lock lck(mtx_);
-  return dist_(rng_);
+  int ret = dist_(rng_);
+  return ret + 1;
 }

@@ -1,10 +1,6 @@
 #include "person.h"
 
-void Person::start() {
-  thread_ = std::jthread([this] { action(); });
-}
-
-Person::Person(std::string des, int id) {
+Person::Person(std::string des, int id) : id_(id) {
   name_ = std::move(des);
   name_ += ' ';
   name_ += std::to_string(id);

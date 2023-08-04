@@ -1,10 +1,11 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "student.h"
 
-class Group {
+class Group : public std::enable_shared_from_this<Group> {
 public:
   Group(int id);
 

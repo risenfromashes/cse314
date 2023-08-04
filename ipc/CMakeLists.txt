@@ -10,4 +10,4 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 file(GLOB src_files *.h *.cc)
-add_executable(mancala ${src_files})
+add_executable(ipc ${src_files})

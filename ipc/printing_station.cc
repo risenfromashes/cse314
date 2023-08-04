@@ -1,21 +1,26 @@
 
-#include "printing_station.h"
 #include "config.h"
 #include <cassert>
 #include <chrono>
+#include <iostream>
 #include <mutex>
+#include <syncstream>
 #include <thread>
 
-PrintingStation::PrintingStation() {}
+#include "printing_station.h"
+#include "timer.h"
+
+PrintingStation::PrintingStation() : busy_(false) {}
 
 void PrintingStation::acquire(std::shared_ptr<Student> student) {
   {
     std::scoped_lock lock(mtx_);
     if (!busy_) {
       busy_ = true;
-    } else {
-      waiting_.insert(student);
+      return;
     }
+
+    waiting_.insert(student);
   }
   /* wait for text from peer */
   student->wait();
@@ -56,7 +61,13 @@ bool PrintingStation::test(std::shared_ptr<Student> student) {
 }
 
 void PrintingStation::use(std::shared_ptr<Student> student) {
+  std::osyncstream(std::cout)
+      << student->name() << " has arrived at the print station at time "
+      << Timer::time() << std::endl;
   std::this_thread::sleep_for(std::chrono::seconds(Config::w()));
+  std::osyncstream(std::cout)
+      << student->name() << " has finished printing at time " << Timer::time()
+      << std::endl;
 }
 
 void PrintingStation::take(std::shared_ptr<Student> student) {

@@ -12,7 +12,7 @@ class PrintingStation;
 class BindingStations;
 class EntryBook;
 
-class Student : public Person, std::enable_shared_from_this<Student> {
+class Student : public Person, public std::enable_shared_from_this<Student> {
 public:
   Student(int id);
 
@@ -33,10 +33,13 @@ public:
 
   bool is_leader();
 
+  void start();
+
 private:
-  void action() override;
+  void action();
 
   std::weak_ptr<Group> group_;
+
   std::shared_ptr<PrintingStation> print_station_;
   std::shared_ptr<BindingStations> binding_stations_;
   std::shared_ptr<EntryBook> entry_book_;
