@@ -1,5 +1,7 @@
 #include "group.h"
 #include <cassert>
+#include <iostream>
+#include <syncstream>
 
 Group::Group(int id) : id_(id) {}
 
@@ -16,4 +18,6 @@ void Group::prepare_binding() {
   for (auto &s : members_) {
     s->recv_print();
   }
+  std::osyncstream(std::cout)
+      << "Group " << id() << " has finished printing" << std::endl;
 }

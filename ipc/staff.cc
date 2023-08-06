@@ -12,7 +12,7 @@ void Staff::action() {
     entry_book_->read(this);
     /* to not starve writers */
     std::this_thread::sleep_for(
-        std::chrono::microseconds(Random::get() % 5 + 1));
+        std::chrono::milliseconds(Random::get() % 5 + 1));
   }
 }
 
