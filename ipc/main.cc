@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
   Config::set_w(w);
   Config::set_x(x);
   Config::set_y(y);
+  Config::set_group_count(n / m);
 
   std::vector<std::shared_ptr<Student>> students(n);
   std::vector<std::shared_ptr<Group>> groups(n / m);
