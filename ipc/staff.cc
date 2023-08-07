@@ -1,4 +1,5 @@
 #include "staff.h"
+#include "config.h"
 #include "entry_book.h"
 #include "random.h"
 
@@ -8,7 +9,8 @@
 Staff::Staff(int id) : Person("Staff", id) {}
 
 void Staff::action() {
-  for (;;) {
+  int m = Config::m();
+  while (entry_book_->submission_count() < m) {
     entry_book_->read(this);
     /* to not starve writers */
     std::this_thread::sleep_for(

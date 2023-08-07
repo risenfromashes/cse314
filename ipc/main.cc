@@ -9,9 +9,21 @@
 #include "timer.h"
 
 #include <cassert>
+#include <cstdio>
 #include <iostream>
 
-int main() {
+int main(int argc, char **argv) {
+  for (int i = 1; i < argc; i++) {
+    if (i < argc - 1) {
+      if (std::string_view(argv[i]) == "-i") {
+        std::freopen(argv[i + 1], "r", stdin);
+      }
+      if (std::string_view(argv[i]) == "-o") {
+        std::freopen(argv[i + 1], "w", stdout);
+      }
+    }
+  }
+
   int n, m;
   int w, x, y;
 
