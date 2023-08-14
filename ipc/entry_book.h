@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 
@@ -16,5 +17,5 @@ public:
 private:
   std::shared_mutex mtx_;
 
-  int submission_count_ = 0;
+  std::atomic<int> submission_count_ = 0;
 };

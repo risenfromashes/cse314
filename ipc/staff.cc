@@ -5,16 +5,19 @@
 
 #include <chrono>
 #include <iostream>
+#include <syncstream>
 
 Staff::Staff(int id) : Person("Staff", id) {}
 
 void Staff::action() {
-  int m = Config::m();
-  while (entry_book_->submission_count() < m) {
-    entry_book_->read(this);
+  int m = Config::group_count();
+  for (;;) {
     /* to not starve writers */
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(Random::get() % 5 + 1));
+    std::this_thread::sleep_for(std::chrono::seconds(Random::get() % 5 + 1));
+    entry_book_->read(this);
+    if (entry_book_->submission_count() >= m) {
+      break;
+    }
   }
 }
 
