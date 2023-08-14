@@ -1,0 +1,237 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..cb66a40 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -85,6 +85,8 @@ void            printfinit(void);
+ int             cpuid(void);
+ void            exit(int);
+ int             fork(void);
++int             clone(uint64 fcn, uint64 arg, uint64 stack)
++int             join(int);
+ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+@@ -165,6 +167,7 @@ void            uvmfirst(pagetable_t, uchar *, uint);
+ uint64          uvmalloc(pagetable_t, uint64, uint64, int);
+ uint64          uvmdealloc(pagetable_t, uint64, uint64);
+ int             uvmcopy(pagetable_t, pagetable_t, uint64);
++int             uvmmirror(pagetable_t, pagetable_t, uint64);
+ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..824e95e 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -325,6 +325,62 @@ fork(void)
+   return pid;
+ }
+ 
++
++// Create a new process, copying the parent.
++// Sets up child kernel stack to return as if from fork() system call.
++int
++clone(uint64 fcn, uint64 arg, uint64 stack)
++{
++  int i, pid;
++  struct proc *np;
++  struct proc *p = myproc();
++
++  // Allocate process.
++  if((np = allocproc()) == 0){
++    return -1;
++  }
++
++  // Copy user memory from parent to child.
++  if(uvmmirror(p->pagetable, np->pagetable, p->sz) < 0){
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  np->sz = p->sz;
++
++  // copy saved user registers.
++  *(np->trapframe) = *(p->trapframe);
++
++  np->trapframe->epc = fcn;
++  np->trapframe->a0 = arg;
++  // align by 16 bytes
++  np->trapframe->sp = (stack + PGSIZE) & ~(15);
++  uint64 ra = 0xFFFFFFFF;
++  if(copyout(p->pagetable, sp, (char*)&ra, sizeof(uint64)) < 0) {
++  }
++
++  // increment reference counts on open file descriptors.
++  for(i = 0; i < NOFILE; i++)
++    if(p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  pid = np->pid;
++
++  release(&np->lock);
++  acquire(&wait_lock);
++  np->parent = p;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return pid;
++}
++
+ // Pass p's abandoned children to init.
+ // Caller must hold wait_lock.
+ void
+@@ -506,6 +562,7 @@ yield(void)
+   acquire(&p->lock);
+   p->state = RUNNABLE;
+   sched();
++  p->thread_context.trapframe = *(p->trapframe);
+   release(&p->lock);
+ }
+ 
+@@ -603,6 +660,55 @@ kill(int pid)
+   return -1;
+ }
+ 
++
++// Kill the thread with the given tid.
++// The victim won't exit until it tries to return
++// to user space (see usertrap() in trap.c).
++int
++stop(int tid)
++{
++  if (tid == 0) {
++    panic("exitting main thread");
++  }
++
++  struct proc *p, *parent;
++  int pid, ppid;
++  struct proc* mp = myproc();
++
++  acquire(&wait_lock);
++  parent = mp->parent;
++  release(&wait_lock);
++
++  acquire(&parent->lock);
++  ppid = parent->pid;
++  release(&parent->lock);
++
++  
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++
++    acquire(&wait_lock);
++    parent = p->parent;
++    release(&wait_lock);
++
++    acquire(&parent->lock);
++    ppid = parent->pid;
++    acquire(&parent->lock);
++
++    if(ppid == pid && p->tid == tid){
++      p->killed = 1;
++      if(p->state == SLEEPING){
++        // Wake process from sleep().
++        p->state = RUNNABLE;
++      }
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
+ void
+ setkilled(struct proc *p)
+ {
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..6177abd 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -20,10 +20,10 @@ struct context {
+ 
+ // Per-CPU state.
+ struct cpu {
+-  struct proc *proc;          // The process running on this cpu, or null.
+-  struct context context;     // swtch() here to enter scheduler().
+-  int noff;                   // Depth of push_off() nesting.
+-  int intena;                 // Were interrupts enabled before push_off()?
++  struct proc *proc;      // The process running on this cpu, or null.
++  struct context context; // swtch() here to enter scheduler().
++  int noff;               // Depth of push_off() nesting.
++  int intena;             // Were interrupts enabled before push_off()?
+ };
+ 
+ extern struct cpu cpus[NCPU];
+@@ -86,14 +86,17 @@ struct proc {
+   struct spinlock lock;
+ 
+   // p->lock must be held when using these:
+-  enum procstate state;        // Process state
+-  void *chan;                  // If non-zero, sleeping on chan
+-  int killed;                  // If non-zero, have been killed
+-  int xstate;                  // Exit status to be returned to parent's wait
+-  int pid;                     // Process ID
++  enum procstate state; // Process state
++  void *chan;           // If non-zero, sleeping on chan
++  int killed;           // If non-zero, have been killed
++  int xstate;           // Exit status to be returned to parent's wait
++  int pid;              // Process ID
++  int tid;              // Thread Id
++  int parent_pid;       // Thread's parent ID
++  int active_threads;   // number of threads associated with process
+ 
+   // wait_lock must be held when using this:
+-  struct proc *parent;         // Parent process
++  struct proc *parent; // Parent process
+ 
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..b0cdb8f 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -332,6 +332,37 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   return -1;
+ }
+ 
++// Given a parent process's page table, 
++// map it's memory into a child thread
++// its memory into a child's page table.
++// Copies both the page table but not physical memory
++// returns 0 on success, -1 on failure.
++// frees any allocated pages on failure.
++int
++uvmmirror(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmmirror: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmmirror: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
