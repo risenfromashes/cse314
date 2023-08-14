@@ -1,69 +1,452 @@
+diff --git a/compile_flags.txt b/compile_flags.txt
+new file mode 100644
+index 0000000..57dc239
+--- /dev/null
++++ b/compile_flags.txt
+@@ -0,0 +1 @@
++-I.
+\ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..cb66a40 100644
+index a3c962b..426a082 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -85,6 +85,8 @@ void            printfinit(void);
  int             cpuid(void);
  void            exit(int);
  int             fork(void);
-+int             clone(uint64 fcn, uint64 arg, uint64 stack)
++int             clone(uint64 fcn, uint64 arg, uint64 stack);
 +int             join(int);
  int             growproc(int);
  void            proc_mapstacks(pagetable_t);
  pagetable_t     proc_pagetable(struct proc *);
-@@ -165,6 +167,7 @@ void            uvmfirst(pagetable_t, uchar *, uint);
+@@ -95,6 +97,7 @@ void            setkilled(struct proc*);
+ struct cpu*     mycpu(void);
+ struct cpu*     getmycpu(void);
+ struct proc*    myproc();
++void            smeminit(void);
+ void            procinit(void);
+ void            scheduler(void) __attribute__((noreturn));
+ void            sched(void);
+@@ -164,7 +167,9 @@ pagetable_t     uvmcreate(void);
+ void            uvmfirst(pagetable_t, uchar *, uint);
  uint64          uvmalloc(pagetable_t, uint64, uint64, int);
  uint64          uvmdealloc(pagetable_t, uint64, uint64);
++uint64          uvmdemirror(pagetable_t, uint64, uint64);
  int             uvmcopy(pagetable_t, pagetable_t, uint64);
-+int             uvmmirror(pagetable_t, pagetable_t, uint64);
++int             uvmmirror(pagetable_t, pagetable_t, uint64, uint64);
  void            uvmfree(pagetable_t, uint64);
  void            uvmunmap(pagetable_t, uint64, uint64, int);
  void            uvmclear(pagetable_t, uint64);
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..2b3ec8f 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -20,6 +20,7 @@ main()
+     kvminit();       // create kernel page table
+     kvminithart();   // turn on paging
+     procinit();      // process table
++    smeminit();      // sharedmem table
+     trapinit();      // trap vectors
+     trapinithart();  // install kernel trap vector
+     plicinit();      // set up interrupt controller
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..824e95e 100644
+index 959b778..162b03b 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -325,6 +325,62 @@ fork(void)
+@@ -10,6 +10,8 @@ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+ 
++struct sharedmem smem[NPROC];
++
+ struct proc *initproc;
+ 
+ int nextpid = 1;
+@@ -17,6 +19,7 @@ struct spinlock pid_lock;
+ 
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
++static void freesmem(struct sharedmem *s);
+ 
+ extern char trampoline[]; // trampoline.S
+ 
+@@ -26,6 +29,28 @@ extern char trampoline[]; // trampoline.S
+ // must be acquired before any p->lock.
+ struct spinlock wait_lock;
+ 
++
++// lock must be held
++static void 
++smem_up(struct sharedmem *smem) 
++{
++  if (smem->state == UNUSED) {
++    panic("Referencing UNUSED sharedmem");
++  }
++  smem->ref_count++;
++}
++
++// lock must be held
++static void 
++smem_down(struct sharedmem *smem) 
++{
++  smem->ref_count--;
++  if(smem->ref_count == 0) {
++    proc_freepagetable(smem->pagetable, smem->sz);
++    freesmem(smem);
++  }
++}
++
+ // Allocate a page for each process's kernel stack.
+ // Map it high in memory, followed by an invalid
+ // guard page.
+@@ -58,6 +83,21 @@ procinit(void)
+   }
+ }
+ 
++
++// initialize the sharedmem table.
++void
++smeminit(void)
++{
++  struct sharedmem *s;
++
++  for(s = smem; s < &smem[NPROC]; s++) {
++      initlock(&s->lock, "sharedmem");
++      s->sz = 0;
++      s->ref_count = 0;
++      s->state = UNUSED;
++  }
++}
++
+ // Must be called with interrupts disabled,
+ // to prevent race with process being moved
+ // to a different CPU.
+@@ -102,12 +142,32 @@ allocpid()
+   return pid;
+ }
+ 
++
++// Look in the smem table for an UNUSED smem
++// return with smem->lock held
++static struct sharedmem* 
++allocsmem(void) 
++{
++  struct sharedmem *s;
++  // look for free sharedmem struct
++  for(s = smem; s < &smem[NPROC]; s++) {
++    acquire(&s->lock);
++    if(s->state == UNUSED) {
++      s->state = USED;
++      return s;
++    } else {
++      release(&s->lock);
++    }
++  }
++  return 0;
++}
++
+ // Look in the process table for an UNUSED proc.
+ // If found, initialize state required to run in the kernel,
+-// and return with p->lock held.
++// and return with p->lock and p->smem->lock held.
+ // If there are no free procs, or a memory allocation fails, return 0.
+ static struct proc*
+-allocproc(void)
++allocproc(int is_thread)
+ {
+   struct proc *p;
+ 
+@@ -122,12 +182,23 @@ allocproc(void)
+   return 0;
+ 
+ found:
++  p->is_thread = is_thread;
++
++  if(!p->is_thread) {
++    if ((p->smem = allocsmem()) == 0) {
++      release(&p->lock);
++      return 0;    
++    }
++  }
++
+   p->pid = allocpid();
+   p->state = USED;
+ 
++
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     freeproc(p);
++    release(&p->smem->lock);
+     release(&p->lock);
+     return 0;
+   }
+@@ -136,10 +207,18 @@ found:
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+     freeproc(p);
++    release(&p->smem->lock);
+     release(&p->lock);
+     return 0;
+   }
+ 
++  // setup smem if this is the main thread
++  if (!p->is_thread) {
++    p->smem->mem_id = p->pid;    
++    p->smem->pagetable = p->pagetable;
++    // increase refcount
++    smem_up(p->smem);
++  }
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -149,17 +228,26 @@ found:
+   return p;
+ }
+ 
++
++
+ // free a proc structure and the data hanging from it,
+ // including user pages.
+-// p->lock must be held.
++// p->lock, p->smem->lock must be held.
+ static void
+ freeproc(struct proc *p)
+ {
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++  if(p->pagetable) {
++    if (p->is_thread) {
++      // delete page table but not physical addresses
++      uvmdemirror(p->pagetable, p->sz, 0);
++      proc_freepagetable(p->pagetable, 0);
++    }
++    // decrease ref count of base pagetable
++    smem_down(p->smem);
++  }
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -171,6 +259,18 @@ freeproc(struct proc *p)
+   p->state = UNUSED;
+ }
+ 
++
++// free a smem structure
++// s->lock must be held.
++static void
++freesmem(struct sharedmem *s)
++{
++  s->mem_id = 0;
++  s->ref_count = 0;
++  s->sz = 0;
++  s->state = UNUSED;
++}
++
+ // Create a user page table for a given process, with no user memory,
+ // but with trampoline and trapframe pages.
+ pagetable_t
+@@ -234,13 +334,13 @@ userinit(void)
+ {
+   struct proc *p;
+ 
+-  p = allocproc();
++  p = allocproc(0);
+   initproc = p;
+   
+   // allocate one user page and copy initcode's instructions
+   // and data into it.
+   uvmfirst(p->pagetable, initcode, sizeof(initcode));
+-  p->sz = PGSIZE;
++  p->smem->sz = p->sz = PGSIZE;
+ 
+   // prepare for the very first "return" from kernel to user.
+   p->trapframe->epc = 0;      // user program counter
+@@ -251,29 +351,90 @@ userinit(void)
+ 
+   p->state = RUNNABLE;
+ 
++  release(&p->smem->lock);
+   release(&p->lock);
+ }
+ 
+ // Grow or shrink user memory by n bytes.
+ // Return 0 on success, -1 on failure.
+-int
+-growproc(int n)
+-{
+-  uint64 sz;
+-  struct proc *p = myproc();
++int 
++growproc(int n) {
++  uint64 sz, new_sz;
++  int mem_id;
++
++  struct proc *mp = myproc();
++
++  acquire(&mp->smem->lock);
+ 
+-  sz = p->sz;
+-  if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++  if (mp->smem->sz != mp->sz) {
++    panic("Pagetables not synchronized");
++  }
++
++  mem_id = mp->mem_id;
++  sz = mp->sz;
++  new_sz = mp->sz + n;
++
++  if (n > 0) {
++    // allocate for self
++    if ((mp->sz = uvmalloc(mp->pagetable, sz, sz + n, PTE_W)) == 0) {
++      mp->sz = sz;
++      release(&mp->smem->lock);
+       return -1;
+     }
+-  } else if(n < 0){
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
++
++    // mirror for rest
++    for(struct proc* p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if (p->mem_id == mem_id) {
++        if (p->sz != sz) {
++          panic("Pagetables not synchronized");
++        }
++
++        if ((p->sz = uvmmirror(mp->pagetable, p->pagetable, sz, sz + n)) == 0) {
++          // reset to original size
++          p->sz = sz;
++          release(&p->lock);
++          goto bad;
++        }
++      }
++      release(&p->lock);
++    }
++  } else if (n < 0) {
++    // deallocate for self
++    mp->sz = uvmdealloc(mp->pagetable, sz, new_sz);
++    // deallocate for others
++    for(struct proc* p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if (p->mem_id == mem_id) {
++        if (p->sz != sz) {
++          panic("Pagetables not synchronized");
++        }
++        p->sz = uvmdemirror(p->pagetable, sz, new_sz);
++      }
++      release(&p->lock);
++    }
+   }
+-  p->sz = sz;
++
++  mp->smem->sz = mp->sz;
++  release(&mp->smem->lock);
+   return 0;
+-}
++bad:
++  // deallocate for self
++  mp->sz = uvmdealloc(mp->pagetable, mp->sz, sz);
++  // deallocate for others
++  for(struct proc* p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->mem_id == mem_id) {
++      if(p->sz != sz) {
++        p->sz = uvmdemirror(p->pagetable, p->sz, sz);
++      }
++    }
++    release(&p->lock);
++  }
+ 
++  release(&mp->smem->lock);
++  return -1;
++}
+ // Create a new process, copying the parent.
+ // Sets up child kernel stack to return as if from fork() system call.
+ int
+@@ -284,7 +445,7 @@ fork(void)
+   struct proc *p = myproc();
+ 
+   // Allocate process.
+-  if((np = allocproc()) == 0){
++  if((np = allocproc(0)) == 0){
+     return -1;
+   }
+ 
+@@ -294,7 +455,8 @@ fork(void)
+     release(&np->lock);
+     return -1;
+   }
+-  np->sz = p->sz;
++
++  np->smem->sz = np->sz = p->sz;
+ 
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+@@ -312,6 +474,7 @@ fork(void)
+ 
+   pid = np->pid;
+ 
++  release(&np->smem->lock);
+   release(&np->lock);
+ 
+   acquire(&wait_lock);
+@@ -325,6 +488,74 @@ fork(void)
    return pid;
  }
  
 +
 +// Create a new process, copying the parent.
 +// Sets up child kernel stack to return as if from fork() system call.
-+int
-+clone(uint64 fcn, uint64 arg, uint64 stack)
-+{
++int 
++clone(uint64 fcn, uint64 arg, uint64 stack) {
 +  int i, pid;
 +  struct proc *np;
 +  struct proc *p = myproc();
++  uint64 sp = stack + PGSIZE;
++
++  // align by 16 bytes
++  sp -= (sp % 16);
 +
 +  // Allocate process.
-+  if((np = allocproc()) == 0){
++  if ((np = allocproc(1)) == 0) {
 +    return -1;
 +  }
 +
-+  // Copy user memory from parent to child.
-+  if(uvmmirror(p->pagetable, np->pagetable, p->sz) < 0){
++  // mirror parent page table
++  if (uvmmirror(p->pagetable, np->pagetable, 0, p->sz) < 0) {
 +    freeproc(np);
++    release(&np->smem->lock);
 +    release(&np->lock);
 +    return -1;
 +  }
++
++  np->smem = p->smem;
 +  np->sz = p->sz;
 +
 +  // copy saved user registers.
 +  *(np->trapframe) = *(p->trapframe);
 +
-+  np->trapframe->epc = fcn;
-+  np->trapframe->a0 = arg;
-+  // align by 16 bytes
-+  np->trapframe->sp = (stack + PGSIZE) & ~(15);
++
++  sp -= 16;
 +  uint64 ra = 0xFFFFFFFF;
-+  if(copyout(p->pagetable, sp, (char*)&ra, sizeof(uint64)) < 0) {
++  if (copyout(p->pagetable, sp, (char *)&ra, sizeof(uint64)) < 0) {
++    freeproc(np);
++    release(&np->smem->lock);
++    release(&np->lock);
++    return -1;
 +  }
 +
++  // prepare trapframe
++  np->trapframe->epc = fcn;
++  np->trapframe->a0 = arg;
++  np->trapframe->sp = sp;
 +  // increment reference counts on open file descriptors.
-+  for(i = 0; i < NOFILE; i++)
-+    if(p->ofile[i])
++  for (i = 0; i < NOFILE; i++)
++    if (p->ofile[i])
 +      np->ofile[i] = filedup(p->ofile[i]);
 +  np->cwd = idup(p->cwd);
 +
@@ -86,72 +469,15 @@ index 959b778..824e95e 100644
  // Pass p's abandoned children to init.
  // Caller must hold wait_lock.
  void
-@@ -506,6 +562,7 @@ yield(void)
-   acquire(&p->lock);
-   p->state = RUNNABLE;
-   sched();
-+  p->thread_context.trapframe = *(p->trapframe);
-   release(&p->lock);
- }
- 
-@@ -603,6 +660,55 @@ kill(int pid)
-   return -1;
- }
- 
-+
-+// Kill the thread with the given tid.
-+// The victim won't exit until it tries to return
-+// to user space (see usertrap() in trap.c).
-+int
-+stop(int tid)
-+{
-+  if (tid == 0) {
-+    panic("exitting main thread");
-+  }
-+
-+  struct proc *p, *parent;
-+  int pid, ppid;
-+  struct proc* mp = myproc();
-+
-+  acquire(&wait_lock);
-+  parent = mp->parent;
-+  release(&wait_lock);
-+
-+  acquire(&parent->lock);
-+  ppid = parent->pid;
-+  release(&parent->lock);
-+
-+  
-+  for(p = proc; p < &proc[NPROC]; p++){
-+    acquire(&p->lock);
-+
-+    acquire(&wait_lock);
-+    parent = p->parent;
-+    release(&wait_lock);
-+
-+    acquire(&parent->lock);
-+    ppid = parent->pid;
-+    acquire(&parent->lock);
-+
-+    if(ppid == pid && p->tid == tid){
-+      p->killed = 1;
-+      if(p->state == SLEEPING){
-+        // Wake process from sleep().
-+        p->state = RUNNABLE;
-+      }
-+      release(&p->lock);
-+      return 0;
-+    }
-+    release(&p->lock);
-+  }
-+  return -1;
+@@ -680,4 +911,4 @@ procdump(void)
+     printf("%d %s %s", p->pid, state, p->name);
+     printf("\n");
+   }
+-}
 +}
-+
- void
- setkilled(struct proc *p)
- {
+\ No newline at end of file
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..6177abd 100644
+index d021857..0c6b67a 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
 @@ -20,10 +20,10 @@ struct context {
@@ -169,7 +495,26 @@ index d021857..6177abd 100644
  };
  
  extern struct cpu cpus[NCPU];
-@@ -86,14 +86,17 @@ struct proc {
+@@ -81,19 +81,35 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++// structure to bookkeep memory shared by threads
++struct sharedmem {
++  struct spinlock lock;
++  // lock must be held
++  int mem_id;
++  int ref_count;
++  // either USED or UNUSED
++  enum procstate state;
++  // base page table, this is freed by smem_down
++  pagetable_t pagetable;
++  // size of pagetable
++  uint64 sz;
++};
++
+ // Per-process state
+ struct proc {
    struct spinlock lock;
  
    // p->lock must be held when using these:
@@ -183,9 +528,8 @@ index d021857..6177abd 100644
 +  int killed;           // If non-zero, have been killed
 +  int xstate;           // Exit status to be returned to parent's wait
 +  int pid;              // Process ID
-+  int tid;              // Thread Id
-+  int parent_pid;       // Thread's parent ID
-+  int active_threads;   // number of threads associated with process
++  int mem_id;           // Thread's parent ID
++  int is_thread;        // If non-zero, this is a thread
  
    // wait_lock must be held when using this:
 -  struct proc *parent;         // Parent process
@@ -193,11 +537,40 @@ index d021857..6177abd 100644
  
    // these are private to the process, so p->lock need not be held.
    uint64 kstack;               // Virtual address of kernel stack
+@@ -104,4 +120,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  struct sharedmem *smem;      // Shared memory bookkeeping
+ };
 diff --git a/kernel/vm.c b/kernel/vm.c
-index 9f69783..b0cdb8f 100644
+index 9f69783..e68e01c 100644
 --- a/kernel/vm.c
 +++ b/kernel/vm.c
-@@ -332,6 +332,37 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+@@ -266,6 +266,21 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+   return newsz;
+ }
+ 
++// only unmap pagetables for threads
++uint64
++uvmdemirror(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++{
++  if(newsz >= oldsz)
++    return oldsz;
++
++  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
++    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
++    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 0);
++  }
++
++  return newsz;
++}
++
+ // Recursively free page-table pages.
+ // All leaf mappings must already have been removed.
+ void
+@@ -332,6 +347,39 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
    return -1;
  }
  
@@ -208,13 +581,15 @@ index 9f69783..b0cdb8f 100644
 +// returns 0 on success, -1 on failure.
 +// frees any allocated pages on failure.
 +int
-+uvmmirror(pagetable_t old, pagetable_t new, uint64 sz)
++uvmmirror(pagetable_t old, pagetable_t new, uint64 start, uint64 end)
 +{
 +  pte_t *pte;
 +  uint64 pa, i;
 +  uint flags;
 +
-+  for(i = 0; i < sz; i += PGSIZE){
++  start = PGROUNDUP(start);
++
++  for(i = start; i < end; i += PGSIZE){
 +    if((pte = walk(old, i, 0)) == 0)
 +      panic("uvmmirror: pte should exist");
 +    if((*pte & PTE_V) == 0)
@@ -228,7 +603,7 @@ index 9f69783..b0cdb8f 100644
 +  return 0;
 +
 + err:
-+  uvmunmap(new, 0, i / PGSIZE, 1);
++  uvmunmap(new, 0, i / PGSIZE, 0);
 +  return -1;
 +}
 +
