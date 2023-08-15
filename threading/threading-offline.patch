@@ -50,7 +50,7 @@ index f0d3171..2b3ec8f 100644
      trapinithart();  // install kernel trap vector
      plicinit();      // set up interrupt controller
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..162b03b 100644
+index 959b778..0a80231 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -10,6 +10,8 @@ struct cpu cpus[NCPU];
@@ -62,7 +62,7 @@ index 959b778..162b03b 100644
  struct proc *initproc;
  
  int nextpid = 1;
-@@ -17,6 +19,7 @@ struct spinlock pid_lock;
+@@ -17,15 +19,38 @@ struct spinlock pid_lock;
  
  extern void forkret(void);
  static void freeproc(struct proc *p);
@@ -70,7 +70,10 @@ index 959b778..162b03b 100644
  
  extern char trampoline[]; // trampoline.S
  
-@@ -26,6 +29,28 @@ extern char trampoline[]; // trampoline.S
+-// helps ensure that wakeups of wait()ing
++// helps ensure that wakeups of wait()ing and join()ing
+ // parents are not lost. helps obey the
+ // memory model when using p->parent.
  // must be acquired before any p->lock.
  struct spinlock wait_lock;
  
@@ -191,7 +194,7 @@ index 959b778..162b03b 100644
  
 +  // setup smem if this is the main thread
 +  if (!p->is_thread) {
-+    p->smem->mem_id = p->pid;    
++    p->mem_id = p->pid;    
 +    p->smem->pagetable = p->pagetable;
 +    // increase refcount
 +    smem_up(p->smem);
@@ -239,7 +242,7 @@ index 959b778..162b03b 100644
 +static void
 +freesmem(struct sharedmem *s)
 +{
-+  s->mem_id = 0;
++  s->pagetable = 0;
 +  s->ref_count = 0;
 +  s->sz = 0;
 +  s->state = UNUSED;
@@ -264,7 +267,7 @@ index 959b778..162b03b 100644
  
    // prepare for the very first "return" from kernel to user.
    p->trapframe->epc = 0;      // user program counter
-@@ -251,29 +351,90 @@ userinit(void)
+@@ -251,29 +351,94 @@ userinit(void)
  
    p->state = RUNNABLE;
  
@@ -282,23 +285,27 @@ index 959b778..162b03b 100644
 +int 
 +growproc(int n) {
 +  uint64 sz, new_sz;
-+  int mem_id;
++  int mem_id, pid;
 +
 +  struct proc *mp = myproc();
 +
 +  acquire(&mp->smem->lock);
- 
--  sz = p->sz;
--  if(n > 0){
--    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++
 +  if (mp->smem->sz != mp->sz) {
 +    panic("Pagetables not synchronized");
 +  }
 +
++  acquire(&mp->lock);
 +  mem_id = mp->mem_id;
++  pid = mp->pid;
++  release(&mp->lock);
++
 +  sz = mp->sz;
 +  new_sz = mp->sz + n;
-+
+ 
+-  sz = p->sz;
+-  if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
 +  if (n > 0) {
 +    // allocate for self
 +    if ((mp->sz = uvmalloc(mp->pagetable, sz, sz + n, PTE_W)) == 0) {
@@ -312,7 +319,7 @@ index 959b778..162b03b 100644
 +    // mirror for rest
 +    for(struct proc* p = proc; p < &proc[NPROC]; p++) {
 +      acquire(&p->lock);
-+      if (p->mem_id == mem_id) {
++      if (p->mem_id == mem_id && p->pid != pid) {
 +        if (p->sz != sz) {
 +          panic("Pagetables not synchronized");
 +        }
@@ -332,7 +339,7 @@ index 959b778..162b03b 100644
 +    // deallocate for others
 +    for(struct proc* p = proc; p < &proc[NPROC]; p++) {
 +      acquire(&p->lock);
-+      if (p->mem_id == mem_id) {
++      if (p->mem_id == mem_id && p->pid != pid) {
 +        if (p->sz != sz) {
 +          panic("Pagetables not synchronized");
 +        }
@@ -353,7 +360,7 @@ index 959b778..162b03b 100644
 +  // deallocate for others
 +  for(struct proc* p = proc; p < &proc[NPROC]; p++) {
 +    acquire(&p->lock);
-+    if (p->mem_id == mem_id) {
++    if (p->mem_id == mem_id && p->pid != pid) {
 +      if(p->sz != sz) {
 +        p->sz = uvmdemirror(p->pagetable, p->sz, sz);
 +      }
@@ -367,7 +374,7 @@ index 959b778..162b03b 100644
  // Create a new process, copying the parent.
  // Sets up child kernel stack to return as if from fork() system call.
  int
-@@ -284,7 +445,7 @@ fork(void)
+@@ -284,7 +449,7 @@ fork(void)
    struct proc *p = myproc();
  
    // Allocate process.
@@ -376,7 +383,7 @@ index 959b778..162b03b 100644
      return -1;
    }
  
-@@ -294,7 +455,8 @@ fork(void)
+@@ -294,7 +459,8 @@ fork(void)
      release(&np->lock);
      return -1;
    }
@@ -386,7 +393,7 @@ index 959b778..162b03b 100644
  
    // copy saved user registers.
    *(np->trapframe) = *(p->trapframe);
-@@ -312,6 +474,7 @@ fork(void)
+@@ -312,6 +478,7 @@ fork(void)
  
    pid = np->pid;
  
@@ -394,7 +401,7 @@ index 959b778..162b03b 100644
    release(&np->lock);
  
    acquire(&wait_lock);
-@@ -325,6 +488,74 @@ fork(void)
+@@ -325,6 +492,75 @@ fork(void)
    return pid;
  }
  
@@ -426,6 +433,7 @@ index 959b778..162b03b 100644
 +
 +  np->smem = p->smem;
 +  np->sz = p->sz;
++  np->mem_id = p->pid;
 +
 +  // copy saved user registers.
 +  *(np->trapframe) = *(p->trapframe);
@@ -469,7 +477,127 @@ index 959b778..162b03b 100644
  // Pass p's abandoned children to init.
  // Caller must hold wait_lock.
  void
-@@ -680,4 +911,4 @@ procdump(void)
+@@ -385,6 +621,8 @@ exit(int status)
+   panic("zombie exit");
+ }
+ 
++
++
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+ int
+@@ -407,17 +645,30 @@ wait(uint64 addr)
+         havekids = 1;
+         if(pp->state == ZOMBIE){
+           // Found one.
+-          pid = pp->pid;
+-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+-                                  sizeof(pp->xstate)) < 0) {
++          if (!pp->is_thread) {
++            // process
++            pid = pp->pid;
++            if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
++                                    sizeof(pp->xstate)) < 0) {
++              release(&pp->lock);
++              release(&wait_lock);
++              return -1;
++            }
++            // free proc
++            acquire(&pp->smem->lock);
++            freeproc(pp);
++            release(&pp->smem->lock);
++            // release locks
+             release(&pp->lock);
+             release(&wait_lock);
+-            return -1;
++            return pid;
++          } else {
++            // free proc
++            acquire(&pp->smem->lock);
++            freeproc(pp);
++            release(&pp->smem->lock);
++            // rest of the locks are still in use
+           }
+-          freeproc(pp);
+-          release(&pp->lock);
+-          release(&wait_lock);
+-          return pid;
+         }
+         release(&pp->lock);
+       }
+@@ -428,12 +679,62 @@ wait(uint64 addr)
+       release(&wait_lock);
+       return -1;
+     }
+-    
+     // Wait for a child to exit.
+     sleep(p, &wait_lock);  //DOC: wait-sleep
+   }
+ }
+ 
++
++// Join thread with another thread
++// Thread must be created before joined
++// Return -1 if this process has no children.
++int
++join(int tid)
++{
++  struct proc *pp;
++  int mem_id;
++  struct proc *p = myproc();
++
++
++  mem_id = p->mem_id;
++  if (p->pid == tid) {
++    // cannot join with self
++    return -1;
++  }
++  if (p->mem_id == tid) {
++    // cannot join main thread with other thread
++    return -1;
++  }
++
++  // find process with matching pid
++  for(pp = proc; pp < &proc[NPROC]; pp++) {
++    acquire(&pp->lock);
++    if (pp->mem_id == mem_id && pp->pid == tid) {
++      // make sure the child isn't still in exit() or swtch().
++      for(;;) {
++
++        if (pp->state == ZOMBIE) {
++          // Found one.
++          freeproc(pp);
++          release(&pp->lock);
++          return tid;
++        }
++
++        if(killed(p)) {
++          release(&pp->lock);
++          return -1;
++        }
++
++        sleep(pp, &pp->lock);
++      }
++    }
++    release(&pp->lock);
++  }
++
++  // no thread with given tid created yet
++  return -1;
++}
++
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+@@ -603,6 +904,7 @@ kill(int pid)
+   return -1;
+ }
+ 
++
+ void
+ setkilled(struct proc *p)
+ {
+@@ -680,4 +982,4 @@ procdump(void)
      printf("%d %s %s", p->pid, state, p->name);
      printf("\n");
    }
@@ -477,7 +605,7 @@ index 959b778..162b03b 100644
 +}
 \ No newline at end of file
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..0c6b67a 100644
+index d021857..28345e4 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
 @@ -20,10 +20,10 @@ struct context {
@@ -495,7 +623,7 @@ index d021857..0c6b67a 100644
  };
  
  extern struct cpu cpus[NCPU];
-@@ -81,19 +81,35 @@ struct trapframe {
+@@ -81,19 +81,34 @@ struct trapframe {
  
  enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
  
@@ -503,7 +631,6 @@ index d021857..0c6b67a 100644
 +struct sharedmem {
 +  struct spinlock lock;
 +  // lock must be held
-+  int mem_id;
 +  int ref_count;
 +  // either USED or UNUSED
 +  enum procstate state;
@@ -528,16 +655,17 @@ index d021857..0c6b67a 100644
 +  int killed;           // If non-zero, have been killed
 +  int xstate;           // Exit status to be returned to parent's wait
 +  int pid;              // Process ID
-+  int mem_id;           // Thread's parent ID
 +  int is_thread;        // If non-zero, this is a thread
  
-   // wait_lock must be held when using this:
+-  // wait_lock must be held when using this:
 -  struct proc *parent;         // Parent process
++  // wait_lock must be held when using these:
 +  struct proc *parent; // Parent process
++  int mem_id;          // Thread's parent ID
  
    // these are private to the process, so p->lock need not be held.
    uint64 kstack;               // Virtual address of kernel stack
-@@ -104,4 +120,6 @@ struct proc {
+@@ -104,4 +119,6 @@ struct proc {
    struct file *ofile[NOFILE];  // Open files
    struct inode *cwd;           // Current directory
    char name[16];               // Process name (debugging)
