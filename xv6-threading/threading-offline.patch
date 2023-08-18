@@ -91,7 +91,7 @@ index f0d3171..2b3ec8f 100644
      trapinithart();  // install kernel trap vector
      plicinit();      // set up interrupt controller
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..3b178ff 100644
+index 959b778..149d128 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -10,6 +10,8 @@ struct cpu cpus[NCPU];
@@ -337,11 +337,11 @@ index 959b778..3b178ff 100644
 +
 +  mem_id = mp->mem_id;
 +  pid = mp->pid;
-+
  
 -  sz = p->sz;
 -  if(n > 0){
 -    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
++
 +  if (new_sz > sz) {
 +    // allocate for self
 +    if ((mp->sz = uvmalloc(mp->pagetable, sz, new_sz, PTE_W)) == 0) {
@@ -445,9 +445,8 @@ index 959b778..3b178ff 100644
  
    release(&np->lock);
 +  release(&np->smem->lock);
- 
-   acquire(&wait_lock);
--  np->parent = p;
++
++  acquire(&wait_lock);
 +  np->parent = p->is_thread ? p->parent : p;
 +  release(&wait_lock);
 +
@@ -535,8 +534,9 @@ index 959b778..3b178ff 100644
 +
 +  release(&np->lock);
 +  release(&p->smem->lock);
-+
-+  acquire(&wait_lock);
+ 
+   acquire(&wait_lock);
+-  np->parent = p;
 +  np->parent = p->is_thread ? p->parent : p;
    release(&wait_lock);
  
@@ -558,16 +558,16 @@ index 959b778..3b178ff 100644
 +      }
 +      release(&pp->lock);
 +    }
++
++    acquire(&wait_lock);
  
 -  // Give any children to init.
 -  reparent(p);
-+    acquire(&wait_lock);
++    // Give any children to init.
++    reparent(p);
  
 -  // Parent might be sleeping in wait().
 -  wakeup(p->parent);
-+    // Give any children to init.
-+    reparent(p);
-+
 +    // Parent might be sleeping in wait().
 +    wakeup(p->parent);
    
@@ -638,7 +638,7 @@ index 959b778..3b178ff 100644
 +            // free proc
 +            freeproc(pp);
 +            continue;
-+            // continue, don't wakeup if child thread exists
++            // continue, don't wakeup if child thread exits
            }
 -          freeproc(pp);
 -          release(&pp->lock);
@@ -650,7 +650,7 @@ index 959b778..3b178ff 100644
        }
      }
  
-@@ -428,12 +733,78 @@ wait(uint64 addr)
+@@ -428,12 +733,77 @@ wait(uint64 addr)
        release(&wait_lock);
        return -1;
      }
@@ -690,7 +690,6 @@ index 959b778..3b178ff 100644
 +    for(;;) {
 +      acquire(&pp->lock);
 +      if (pp->mem_id == mem_id && pp->pid == tid && pp->killed == 0) {
-+        // make sure the child isn't still in exit() or swtch().
 +        found = 1;
 +        if(killed(p)) {
 +          release(&pp->lock);
@@ -730,7 +729,7 @@ index 959b778..3b178ff 100644
  // Per-CPU process scheduler.
  // Each CPU calls scheduler() after setting itself up.
  // Scheduler never returns.  It loops, doing:
-@@ -561,6 +932,43 @@ sleep(void *chan, struct spinlock *lk)
+@@ -561,6 +931,43 @@ sleep(void *chan, struct spinlock *lk)
    acquire(lk);
  }
  
@@ -774,7 +773,7 @@ index 959b778..3b178ff 100644
  // Wake up all processes sleeping on chan.
  // Must be called without any p->lock.
  void
-@@ -579,6 +987,24 @@ wakeup(void *chan)
+@@ -579,6 +986,24 @@ wakeup(void *chan)
    }
  }
  
@@ -799,7 +798,7 @@ index 959b778..3b178ff 100644
  // Kill the process with the given pid.
  // The victim won't exit until it tries to return
  // to user space (see usertrap() in trap.c).
-@@ -603,6 +1029,7 @@ kill(int pid)
+@@ -603,6 +1028,7 @@ kill(int pid)
    return -1;
  }
  
@@ -807,7 +806,7 @@ index 959b778..3b178ff 100644
  void
  setkilled(struct proc *p)
  {
-@@ -659,17 +1086,18 @@ void
+@@ -659,17 +1085,18 @@ void
  procdump(void)
  {
    static char *states[] = {
@@ -832,7 +831,7 @@ index 959b778..3b178ff 100644
    for(p = proc; p < &proc[NPROC]; p++){
      if(p->state == UNUSED)
        continue;
-@@ -677,7 +1105,8 @@ procdump(void)
+@@ -677,7 +1104,8 @@ procdump(void)
        state = states[p->state];
      else
        state = "???";
