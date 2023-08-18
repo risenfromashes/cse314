@@ -1668,10 +1668,10 @@ index 0000000..46c9467
 +void thread_sem_post(struct thread_sem *);
 diff --git a/user/semtest.c b/user/semtest.c
 new file mode 100644
-index 0000000..58d6546
+index 0000000..42d57ef
 --- /dev/null
 +++ b/user/semtest.c
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,70 @@
 +#include "kernel/types.h"
 +#include "user/user.h"
 +#include "user/sync.h"
@@ -1681,64 +1681,68 @@ index 0000000..58d6546
 +int c;
 +
 +void new_line() {
-+	if (__sync_add_and_fetch(&c, 1) == 3) {
-+		if (__sync_bool_compare_and_swap(&c, 3, 0)) {
-+			printf("\n");
++	for (int i = 0; i < 3; i++) {
++		if (__sync_bool_compare_and_swap(&c, i, (i + 1) % 3)) {
++			if (i == 2) {
++		    printf("\n");
++			}
++			return;
 +		}
 +	}
 +}
 +
 +void thread_p(void*) {
-+	for(;;) {
-+		thread_sem_wait(&p);
-+		thread_sem_wait(&p);
-+		printf("p");
-+		new_line();
-+		thread_sem_post(&q);
-+		thread_sem_post(&r);
-+		sleep(1);
-+	}
++  for(;;) {
++    thread_sem_wait(&p);
++    thread_sem_wait(&p);
++    printf("p");
++    new_line();
++    thread_sem_post(&q);
++    thread_sem_post(&r);
++    // sleep(1);
++  }
 +}
 +
 +void thread_q(void*) {
-+	for(;;) {
-+		thread_sem_wait(&q);
-+		thread_sem_wait(&q);
-+		printf("q");
-+		new_line();
-+		thread_sem_post(&r);
-+		thread_sem_post(&p);
-+		sleep(1);
-+	}
++  for(;;) {
++    thread_sem_wait(&q);
++    thread_sem_wait(&q);
++    printf("q");
++    new_line();
++    thread_sem_post(&r);
++    thread_sem_post(&p);
++    // sleep(1);
++  }
 +}
 +
 +void thread_r(void*) {
-+	for(;;) {
-+		thread_sem_wait(&r);
-+		thread_sem_wait(&r);
-+		printf("r");
-+		new_line();
-+		thread_sem_post(&p);
-+		thread_sem_post(&q);
-+		sleep(1);
-+	}
++  for(;;) {
++    thread_sem_wait(&r);
++    thread_sem_wait(&r);
++    printf("r");
++    new_line();
++    thread_sem_post(&p);
++    thread_sem_post(&q);
++    // sleep(1);
++  }
 +}
 +
 +int main() {
-+	thread_sem_init(&p, 2);
-+	thread_sem_init(&q, 2);
-+	thread_sem_init(&r, 2);
-+	void *s1 = malloc(4096);
-+	void *s2 = malloc(4096);
-+	void *s3 = malloc(4096);
-+	int th1 = thread_create(thread_p, 0, s1);
-+	int th2 = thread_create(thread_q, 0, s2);
-+	int th3 = thread_create(thread_r, 0, s3);
-+	thread_join(th1);
-+	thread_join(th2);
-+	thread_join(th3);
-+	return 0;
++  thread_sem_init(&p, 2);
++  thread_sem_init(&q, 2);
++  thread_sem_init(&r, 2);
++  void *s1 = malloc(4096);
++  void *s2 = malloc(4096);
++  void *s3 = malloc(4096);
++  int th1 = thread_create(thread_p, 0, s1);
++  int th2 = thread_create(thread_q, 0, s2);
++  int th3 = thread_create(thread_r, 0, s3);
++  thread_join(th1);
++  thread_join(th2);
++  thread_join(th3);
++  return 0;
 +}
+\ No newline at end of file
 diff --git a/user/spinlock.c b/user/spinlock.c
 new file mode 100644
 index 0000000..3a3c668
