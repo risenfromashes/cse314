@@ -92,7 +92,7 @@ index f0d3171..2b3ec8f 100644
      trapinithart();  // install kernel trap vector
      plicinit();      // set up interrupt controller
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..2e6bcdf 100644
+index 959b778..1dd972a 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -10,6 +10,8 @@ struct cpu cpus[NCPU];
@@ -606,12 +606,14 @@ index 959b778..2e6bcdf 100644
  // Wait for a child process to exit and return its pid.
  // Return -1 if this process has no children.
  int
-@@ -402,24 +696,35 @@ wait(uint64 addr)
+@@ -401,25 +695,36 @@ wait(uint64 addr)
+     havekids = 0;
      for(pp = proc; pp < &proc[NPROC]; pp++){
        if(pp->parent == p){
-         // make sure the child isn't still in exit() or swtch().
 +        // this is to avoid potential deadlock
++        // smem lock must be acquired first
 +        acquire(&pp->smem->lock);
+         // make sure the child isn't still in exit() or swtch().
          acquire(&pp->lock);
  
          havekids = 1;
@@ -627,16 +629,15 @@ index 959b778..2e6bcdf 100644
 +            if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
 +                                    sizeof(pp->xstate)) < 0) {
 +              release(&pp->lock);
++              acquire(&pp->smem->lock);
 +              release(&wait_lock);
 +              return -1;
 +            }
 +            freeproc(pp);
-+            // release locks
              release(&wait_lock);
 -            return -1;
 +            return pid;
 +          } else {
-+            // free proc
 +            freeproc(pp);
 +            continue;
 +            // continue, don't wakeup if child thread exits
