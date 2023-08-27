@@ -1201,10 +1201,10 @@ index 9f69783..e4845ef 100644
  void
 diff --git a/user/condvar.c b/user/condvar.c
 new file mode 100644
-index 0000000..362c2c9
+index 0000000..7a577e8
 --- /dev/null
 +++ b/user/condvar.c
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,126 @@
 +#include "kernel/types.h"
 +#include "user/mutex.h"
 +#include "user/condvar.h"
@@ -1278,6 +1278,7 @@ index 0000000..362c2c9
 +thread_cond_wait(struct thread_condvar *cv, struct thread_mutex *m)
 +{
 +	int *s = push(cv);
++	int spin = MAXSPIN;
 +	// pushed to queue
 +	// only this call to cond_wait() now has access to s
 +	__sync_fetch_and_and(s, 0);
@@ -1285,9 +1286,13 @@ index 0000000..362c2c9
 +	thread_mutex_unlock(m);
 +
 +	while(__sync_bool_compare_and_swap(s, 0, 0)) {
-+		__sync_fetch_and_add(&cv->n, 1);
-+		fwait(s, 0);
-+		__sync_fetch_and_add(&cv->n, -1);
++		if (spin > 0) {
++			spin--;
++		} else {
++			__sync_fetch_and_add(&cv->n, 1);
++			fwait(s, 0);
++			__sync_fetch_and_add(&cv->n, -1);
++		}
 +	}
 +	
 +	thread_mutex_lock(m);
