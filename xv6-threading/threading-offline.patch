@@ -1193,10 +1193,10 @@ index 9f69783..e4845ef 100644
  void
 diff --git a/user/condvar.c b/user/condvar.c
 new file mode 100644
-index 0000000..5a4c550
+index 0000000..05893dd
 --- /dev/null
 +++ b/user/condvar.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,98 @@
 +#include "kernel/types.h"
 +#include "user/mutex.h"
 +#include "user/condvar.h"
@@ -1206,24 +1206,62 @@ index 0000000..5a4c550
 +void 
 +thread_cond_init(struct thread_condvar *cv)
 +{
-+	cv->signal = 0;
-+	cv->prev_signal = 0;
++	for(int i = 0; i < CVQLEN; i++) {
++		cv->q[i] = 0;
++	}	
++	cv->front = cv->back = 0;
 +	cv->n = 0;
++}
++
++
++int 
++cv_empty(struct thread_condvar *cv) 
++{
++	return cv->front == cv->back;
++}
++
++int 
++cv_full(struct thread_condvar *cv) 
++{
++	return ((cv->front + 1) % CVQLEN) == cv->back;
++}
++
++int* 
++cv_pop(struct thread_condvar *cv) 
++{
++	if(cv_empty(cv)) {
++		printf("CV queue empty");
++		exit(1);
++	}
++	int *ret = &cv->q[cv->back];
++	cv->back = (cv->back + CVQLEN - 1) % CVQLEN;
++	return ret;
++}
++
++int*
++cv_push(struct thread_condvar *cv) 
++{
++	if(cv_full(cv)) {
++		printf("CV queue full");
++		exit(1);
++	}
++	int *ret = &cv->q[cv->front];
++	cv->front = (cv->front + 1) % CVQLEN;
++	return ret;
 +}
 +
 +void 
 +thread_cond_wait(struct thread_condvar *cv, struct thread_mutex *m)
 +{
-+	int s = __sync_fetch_and_add(&cv->signal, 0);
-+	__sync_lock_test_and_set(&cv->prev_signal, s);
-+
++	int *s = cv_push(cv);
++	__sync_fetch_and_and(s, 0);
 +	// signal reset so can now unlock mutex, any calls to signal
 +	// after this point will wakeup
 +	thread_mutex_unlock(m);
 +
-+	while(__sync_bool_compare_and_swap(&cv->signal, s, s)) {
++	while(__sync_bool_compare_and_swap(s, 0, 0)) {
 +		__sync_fetch_and_add(&cv->n, 1);
-+		fwait(&cv->signal, 0);
++		fwait(s, 0);
 +		__sync_fetch_and_add(&cv->n, -1);
 +		
 +	}
@@ -1235,14 +1273,13 @@ index 0000000..5a4c550
 +thread_cond_signal(struct thread_condvar *cv)
 +{
 +	__sync_synchronize();
-+	if (!__sync_bool_compare_and_swap(&cv->prev_signal, INT_MAX, INT_MAX)) {
-+		__sync_lock_test_and_set(&cv->signal, cv->prev_signal + 1);
-+	} else {
-+		__sync_lock_test_and_set(&cv->signal, 0);
-+	}
++
++	int *s = cv_pop(cv);
++	__sync_bool_compare_and_swap(s, 0, 1);
++
 +	// is there actually someone to wakeup?
 +	if (!__sync_bool_compare_and_swap(&cv->n, 0, 0)) {
-+		fwake(&cv->signal, 1);
++		fwake(s, 1);
 +	}
 +}
 +
@@ -1250,25 +1287,26 @@ index 0000000..5a4c550
 +thread_cond_broadcast(struct thread_condvar *cv)
 +{
 +	__sync_synchronize();
-+	if (!__sync_bool_compare_and_swap(&cv->prev_signal, INT_MAX, INT_MAX)) {
-+		__sync_lock_test_and_set(&cv->signal, cv->prev_signal + 1);
-+	} else {
-+		__sync_lock_test_and_set(&cv->signal, 0);
-+	}
++
++	int *s = cv_pop(cv);
++	__sync_bool_compare_and_swap(s, 0, 1);
 +	// is there actually someone waiting on the cv?
 +	if (!__sync_bool_compare_and_swap(&cv->n, 0, 0)) {
-+		fwake(&cv->signal, 1024 /* more than NPROC */); 
++		fwake(s, 1024 /* more than NPROC */); 
 +	}
 +}
 diff --git a/user/condvar.h b/user/condvar.h
 new file mode 100644
-index 0000000..bf4c44a
+index 0000000..da71e2f
 --- /dev/null
 +++ b/user/condvar.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,13 @@
++/*NPROC + 1 */
++#define CVQLEN 65 
++
 +struct thread_condvar {
-+	int signal;
-+	int prev_signal;
++	int q[CVQLEN];
++	int front, back;
 +	int n;
 +};
 +
