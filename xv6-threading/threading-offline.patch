@@ -1199,16 +1199,12 @@ index 9f69783..e4845ef 100644
  // mark a PTE invalid for user access.
  // used by exec for the user stack guard page.
  void
-diff --git a/user/.condvar.c.swp b/user/.condvar.c.swp
-new file mode 100644
-index 0000000..a0f95cd
-Binary files /dev/null and b/user/.condvar.c.swp differ
 diff --git a/user/condvar.c b/user/condvar.c
 new file mode 100644
-index 0000000..524ca08
+index 0000000..0495797
 --- /dev/null
 +++ b/user/condvar.c
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,109 @@
 +#include "kernel/types.h"
 +#include "user/mutex.h"
 +#include "user/condvar.h"
@@ -1231,7 +1227,7 @@ index 0000000..524ca08
 +}
 +
 +/* pop front element */
-+static int* 
++static int*
 +pop(struct thread_condvar *cv) 
 +{
 +	if(empty(cv)) {
@@ -1241,8 +1237,6 @@ index 0000000..524ca08
 +	cv->front = (cv->front + 1) % CVQLEN;
 +	return ret;
 +}
-+
-+
 +
 +/* push into queue */
 +static int*
@@ -1257,15 +1251,10 @@ index 0000000..524ca08
 +	return ret;
 +}
 +
-+static struct thread_mutex plock;
-+
 +void 
 +thread_cond_init(struct thread_condvar *cv)
 +{
-+	thread_mutex_init(&plock);
-+	for(int i = 0; i < CVQLEN; i++) {
-+		cv->q[i] = 0;
-+	}	
++	memset(&cv->q, 0, sizeof(int) * CVQLEN);
 +	cv->front = cv->back = 0;
 +	cv->n = 0;
 +}
@@ -1276,6 +1265,7 @@ index 0000000..524ca08
 +	int *s = push(cv);
 +	int spin = MAXSPIN;
 +	// pushed to queue
++	// only this call to cond_wait() now has access to s
 +	__sync_fetch_and_and(s, 0);
 +	// pushed, can unlock without potential lost wakeup
 +	thread_mutex_unlock(m);
@@ -1829,7 +1819,7 @@ index 0000000..26fcb4e
 +void thread_sem_cv_post(struct thread_sem_cv *);
 diff --git a/user/semcvtest.c b/user/semcvtest.c
 new file mode 100644
-index 0000000..625a17b
+index 0000000..6893933
 --- /dev/null
 +++ b/user/semcvtest.c
 @@ -0,0 +1,92 @@
@@ -1925,9 +1915,10 @@ index 0000000..625a17b
 +  thread_join(th3);
 +  return 0;
 +}
+\ No newline at end of file
 diff --git a/user/semtest.c b/user/semtest.c
 new file mode 100644
-index 0000000..6cd07ab
+index 0000000..c9aceda
 --- /dev/null
 +++ b/user/semtest.c
 @@ -0,0 +1,92 @@
@@ -2023,6 +2014,7 @@ index 0000000..6cd07ab
 +  thread_join(th3);
 +  return 0;
 +}
+\ No newline at end of file
 diff --git a/user/spinlock.c b/user/spinlock.c
 new file mode 100644
 index 0000000..3a3c668
