@@ -1199,12 +1199,16 @@ index 9f69783..e4845ef 100644
  // mark a PTE invalid for user access.
  // used by exec for the user stack guard page.
  void
+diff --git a/user/.condvar.c.swp b/user/.condvar.c.swp
+new file mode 100644
+index 0000000..a0f95cd
+Binary files /dev/null and b/user/.condvar.c.swp differ
 diff --git a/user/condvar.c b/user/condvar.c
 new file mode 100644
-index 0000000..7a577e8
+index 0000000..524ca08
 --- /dev/null
 +++ b/user/condvar.c
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,115 @@
 +#include "kernel/types.h"
 +#include "user/mutex.h"
 +#include "user/condvar.h"
@@ -1227,16 +1231,17 @@ index 0000000..7a577e8
 +}
 +
 +/* pop front element */
-+static int*
++static int* 
 +pop(struct thread_condvar *cv) 
 +{
 +	if(empty(cv)) {
-+   return NULL;
++		return NULL;
 +	}
-+ int *ret = &cv->q[cv->front];
++	int *ret = &cv->q[cv->front];
 +	cv->front = (cv->front + 1) % CVQLEN;
-+ return ret;
++	return ret;
 +}
++
 +
 +
 +/* push into queue */
@@ -1252,10 +1257,12 @@ index 0000000..7a577e8
 +	return ret;
 +}
 +
++static struct thread_mutex plock;
 +
 +void 
 +thread_cond_init(struct thread_condvar *cv)
 +{
++	thread_mutex_init(&plock);
 +	for(int i = 0; i < CVQLEN; i++) {
 +		cv->q[i] = 0;
 +	}	
@@ -1822,7 +1829,7 @@ index 0000000..26fcb4e
 +void thread_sem_cv_post(struct thread_sem_cv *);
 diff --git a/user/semcvtest.c b/user/semcvtest.c
 new file mode 100644
-index 0000000..32e30af
+index 0000000..625a17b
 --- /dev/null
 +++ b/user/semcvtest.c
 @@ -0,0 +1,92 @@
@@ -1859,7 +1866,7 @@ index 0000000..32e30af
 +	}
 +}
 +
-+void thread_p(void*) {
++void thread_p(void *_) {
 +  for(;;) {
 +    thread_sem_cv_wait(&p);
 +    thread_sem_cv_wait(&p);
@@ -1873,7 +1880,7 @@ index 0000000..32e30af
 +  }
 +}
 +
-+void thread_q(void*) {
++void thread_q(void *_) {
 +  for(;;) {
 +    thread_sem_cv_wait(&q);
 +    thread_sem_cv_wait(&q);
@@ -1887,7 +1894,7 @@ index 0000000..32e30af
 +  }
 +}
 +
-+void thread_r(void*) {
++void thread_r(void *_) {
 +  for(;;) {
 +    thread_sem_cv_wait(&r);
 +    thread_sem_cv_wait(&r);
@@ -1918,10 +1925,9 @@ index 0000000..32e30af
 +  thread_join(th3);
 +  return 0;
 +}
-\ No newline at end of file
 diff --git a/user/semtest.c b/user/semtest.c
 new file mode 100644
-index 0000000..fbe04ca
+index 0000000..6cd07ab
 --- /dev/null
 +++ b/user/semtest.c
 @@ -0,0 +1,92 @@
@@ -1958,7 +1964,7 @@ index 0000000..fbe04ca
 +	}
 +}
 +
-+void thread_p(void*) {
++void thread_p(void *_) {
 +  for(;;) {
 +    thread_sem_wait(&p);
 +    thread_sem_wait(&p);
@@ -1972,7 +1978,7 @@ index 0000000..fbe04ca
 +  }
 +}
 +
-+void thread_q(void*) {
++void thread_q(void *_) {
 +  for(;;) {
 +    thread_sem_wait(&q);
 +    thread_sem_wait(&q);
@@ -1986,7 +1992,7 @@ index 0000000..fbe04ca
 +  }
 +}
 +
-+void thread_r(void*) {
++void thread_r(void *_) {
 +  for(;;) {
 +    thread_sem_wait(&r);
 +    thread_sem_wait(&r);
@@ -2017,7 +2023,6 @@ index 0000000..fbe04ca
 +  thread_join(th3);
 +  return 0;
 +}
-\ No newline at end of file
 diff --git a/user/spinlock.c b/user/spinlock.c
 new file mode 100644
 index 0000000..3a3c668
