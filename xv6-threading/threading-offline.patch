@@ -1227,24 +1227,15 @@ index 0000000..7a577e8
 +}
 +
 +/* pop front element */
-+static void 
++static int*
 +pop(struct thread_condvar *cv) 
 +{
 +	if(empty(cv)) {
-+		printf("CV queue empty");
-+		exit(1);
++   return NULL;
 +	}
++ int *ret = &cv->q[cv->front];
 +	cv->front = (cv->front + 1) % CVQLEN;
-+}
-+
-+/* get front element without popping */
-+static int*
-+peek(struct thread_condvar *cv) 
-+{
-+	if(empty(cv)) {
-+		return NULL;
-+	}
-+	return &cv->q[cv->front];
++ return ret;
 +}
 +
 +
@@ -1261,12 +1252,10 @@ index 0000000..7a577e8
 +	return ret;
 +}
 +
-+static struct thread_mutex plock;
 +
 +void 
 +thread_cond_init(struct thread_condvar *cv)
 +{
-+	thread_mutex_init(&plock);
 +	for(int i = 0; i < CVQLEN; i++) {
 +		cv->q[i] = 0;
 +	}	
@@ -1280,7 +1269,6 @@ index 0000000..7a577e8
 +	int *s = push(cv);
 +	int spin = MAXSPIN;
 +	// pushed to queue
-+	// only this call to cond_wait() now has access to s
 +	__sync_fetch_and_and(s, 0);
 +	// pushed, can unlock without potential lost wakeup
 +	thread_mutex_unlock(m);
@@ -1296,8 +1284,6 @@ index 0000000..7a577e8
 +	}
 +	
 +	thread_mutex_lock(m);
-+	// release access to s by dequeuing
-+	pop(cv);
 +}
 +
 +void 
@@ -1307,7 +1293,7 @@ index 0000000..7a577e8
 +
 +	int *s;
 +
-+	if((s = peek(cv))) {
++	if((s = pop(cv))) {
 +		__sync_bool_compare_and_swap(s, 0, 1);
 +		// is there actually someone waiting on the cv?
 +		if (!__sync_bool_compare_and_swap(&cv->n, 0, 0)) {
@@ -1323,11 +1309,11 @@ index 0000000..7a577e8
 +
 +	int *s;
 +
-+	if((s = peek(cv))) {
++	while((s = pop(cv))) {
 +		__sync_bool_compare_and_swap(s, 0, 1);
 +		// is there actually someone waiting on the cv?
 +		if (!__sync_bool_compare_and_swap(&cv->n, 0, 0)) {
-+			fwake(s, 1024 /* more than NPROC */); 
++			fwake(s, 1); 
 +		}
 +	}
 +}
