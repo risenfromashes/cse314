@@ -19,10 +19,15 @@ index 0000000..57dc239
 +-I.
 \ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..b8a6919 100644
+index a3c962b..ec240e0 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -8,6 +8,7 @@ struct spinlock;
+@@ -1,3 +1,4 @@
++#include "kernel/riscv.h"
+ struct buf;
+ struct context;
+ struct file;
+@@ -8,6 +9,7 @@ struct spinlock;
  struct sleeplock;
  struct stat;
  struct superblock;
@@ -30,7 +35,7 @@ index a3c962b..b8a6919 100644
  
  // bio.c
  void            binit(void);
-@@ -36,6 +37,8 @@ int             filewrite(struct file*, uint64, int n);
+@@ -36,6 +38,8 @@ int             filewrite(struct file*, uint64, int n);
  
  // fs.c
  void            fsinit(int);
@@ -39,7 +44,7 @@ index a3c962b..b8a6919 100644
  int             dirlink(struct inode*, char*, uint);
  struct inode*   dirlookup(struct inode*, char*, uint*);
  struct inode*   ialloc(uint, short);
-@@ -107,6 +110,13 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+@@ -107,6 +111,13 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
  int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
  void            procdump(void);
  
@@ -53,6 +58,19 @@ index a3c962b..b8a6919 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
  
+@@ -185,5 +196,12 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++// page.c
++void mempageinit();
++int allocmempage(pagetable_t, pte_t *, int, struct swap *);
++void freemempage(pte_t *pte);
++void freemempages(pagetable_t);
++
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
 diff --git a/kernel/fs.c b/kernel/fs.c
 index c6bab15..2d9b419 100644
 --- a/kernel/fs.c
@@ -77,10 +95,10 @@ index c6bab15..2d9b419 100644
    struct buf *bp;
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..c8a55ff
+index 0000000..10274dd
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,169 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -126,13 +144,8 @@ index 0000000..c8a55ff
 +/* allocate an in-memory page and map it to va
 + return 0 on success -1 on failure */
 +int
-+allocmempage(pagetable_t pagetable, uint64 va, int flags) 
++allocmempage(pagetable_t pagetable, pte_t *pte, int flags, struct swap *oldsw) 
 +{
-+	pte_t *pte = walk(pagetable, va, 1);
-+	if (!pte) {
-+		return -1;
-+	}
-+
 +	struct mempage *p;
 +
 +	acquire(&swlock);
@@ -149,15 +162,17 @@ index 0000000..c8a55ff
 +			}
 +		}
 +	} else {
-+		struct swap *s = swapalloc();
-+		// need to swap out a page
++		/* allocate new swap */
++		struct swap *sw = swapalloc();
++
++		/* need to swap out a page */
 +		p = head;
 +		head = head->next;
 +
-+		swapout(s, p->pa);
++		swapout(sw, p->pa);
 +
 +		int flags = PTE_FLAGS(*p->pte);
-+		*(p->pte) = PA2PTE(s) | flags | PTE_S;
++		*(p->pte) = PA2PTE(sw) | flags | PTE_S;
 +		*(p->pte) &= ~(PTE_V);
 +	}
 +
@@ -173,60 +188,45 @@ index 0000000..c8a55ff
 +	p->pagetable = pagetable;
 +
 +	release(&swlock);
++
++	if (oldsw) {
++		swapin(p->pa, oldsw);
++		swapfree(oldsw);
++	}
++
 +	return 0;
 +}
 +
-+
-+/* replace an in-memory page from swap */
-+int
-+replacemempage(pagetable_t pagetable, uint64 va, int flags) 
++static void
++freemempagenode(struct mempage *p, struct mempage *prev) 
 +{
-+	pte_t *pte = walk(pagetable, va, 1);
-+	if (!pte) {
-+		return -1;
++	pte_t *pte = p->pte;
++	int flags = PTE_FLAGS(*pte);
++
++	if (flags & PTE_S) {
++		panic("Swapped out page in alive pages list");
 +	}
 +
-+	struct mempage *p;
++	/* unmap pagetable entry */
++	*pte = 0;
 +
-+	acquire(&swlock);
-+	if (free) {
-+		p = free;
-+		free = free->next;
-+
-+		if (p->pa == NULL) {
-+			// not yet allocated, allocate now
-+			if ((p->pa = kalloc()) == 0) {
-+				free = p;
-+				release(&swlock);
-+				return -1;
-+			}
-+		}
++	/* remove linked list node */
++	if (prev) {
++		prev->next = p->next;
 +	} else {
-+		struct swap *s = swapalloc();
-+		// need to swap out a page
-+		p = head;
-+		head = head->next;
-+
-+		swapout(s, p->pa);
-+
-+		int flags = PTE_FLAGS(*p->pte);
-+		*(p->pte) = PA2PTE(s) | flags | PTE_S;
-+		*(p->pte) &= ~(PTE_V);
++		head = prev;
++	}
++	if (p->next == NULL) {
++		tail = prev;
 +	}
 +
-+	/* push to the end of queue */
-+	tail->next = p;
-+	tail = p;
++	/* add to free list */
++	p->next = free;
++	free = p;
 +
-+	
-+	*pte = PA2PTE(p->pa) | flags | PTE_V;
-+	*pte &= ~(PTE_S); // not swapped out
-+
-+	p->pte = pte;
-+	p->pagetable = pagetable;
-+
-+	release(&swlock);
-+	return 0;
++	/* reset pagetable and pte */
++	p->pagetable = NULL;
++	p->pte = NULL;
 +}
 +
 +/* free mempage struct holding pte */
@@ -247,25 +247,11 @@ index 0000000..c8a55ff
 +	acquire(&swlock);
 +	for (p = head, prev = NULL; p; p = p->next) {
 +		if (p->pte == pte) {
-+			if (prev) {
-+				prev->next = p->next;
-+			} else {
-+				head = prev;
-+			}
-+			if (p->next == NULL) {
-+				tail = prev;
-+			}
-+
-+			p->next = free;
-+			free = p;
-+
-+			p->pagetable = NULL;
-+			p->pte = NULL;
++			freemempagenode(p, prev);
 +		}
 +	}
 +	release(&swlock);
 +}
-+
 +
 +/* free mempage struct holding pagetable */
 +void 
@@ -277,33 +263,7 @@ index 0000000..c8a55ff
 +	/* free all the mempage with given pagetable */
 +	for (p = head, prev = NULL; p; p = p->next) {
 +		if (p->pte == pagetable) {
-+			pte_t *pte = p->pte;
-+			int flags = PTE_FLAGS(*pte);
-+
-+			if (flags & PTE_S) {
-+				panic("Swapped out page in alive pages list");
-+			}
-+
-+			/* unmap pagetable entry */
-+			*pte = 0;
-+
-+			/* remove linked list node */
-+			if (prev) {
-+				prev->next = p->next;
-+			} else {
-+				head = prev;
-+			}
-+			if (p->next == NULL) {
-+				tail = prev;
-+			}
-+
-+			/* add to free list */
-+			p->next = free;
-+			free = p;
-+
-+			/* reset pagetable and pte */
-+			p->pagetable = NULL;
-+			p->pte = NULL;
++			freemempagenode(p, prev);
 +		}
 +	}
 +	release(&swlock);
@@ -462,27 +422,27 @@ index 0000000..f33bf40
 +  }
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..0518992 100644
+index 512c850..a07ac2e 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
 @@ -65,6 +65,22 @@ usertrap(void)
      intr_on();
  
      syscall();
-+  } else if(r_scause() == 13 || r_scause() == 15) {
++  } else if(r_scause() == 12 || r_scause() == 13 || r_scause() == 15) {
 +    // page fault
 +    uint64 va = r_stval();
-+    void* pa = walk(p->pagetable, va, 0);
-+    /* TODO */
-+    pte_t* pte = (pte_t *)PA2PTE(pa);
++    pte_t *pte = walk(p->pagetable, va, 0);
 +    int flags = PTE_FLAGS(*pte);
-+
++    struct swap *s = (struct swap *)PTE2PA(*pte);
++    
 +    if (!(flags & PTE_S)) {
 +      printf("usertrap(): unexpected pagefault. pid=%d\n", p->pid);
 +      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
 +      setkilled(p);
 +    } else {
 +      /* swapped out page table entry */
++      allocmempage(p->pagetable, pte, flags, s);
 +    }
 +    
    } else if((which_dev = devintr()) != 0){
