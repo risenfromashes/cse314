@@ -31,7 +31,7 @@ index 0000000..57dc239
 +-I.
 \ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..dfd3895 100644
+index a3c962b..2d7dd62 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -8,6 +8,8 @@ struct spinlock;
@@ -39,7 +39,7 @@ index a3c962b..dfd3895 100644
  struct stat;
  struct superblock;
 +struct swap;
-+struct livepage;
++struct mempage;
  
  // bio.c
  void            binit(void);
@@ -67,17 +67,18 @@ index a3c962b..dfd3895 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
  
-@@ -185,5 +197,14 @@ void            virtio_disk_init(void);
+@@ -185,5 +197,15 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
 +// page.c
-+void             livepageinit();
-+void *           livepageaddr(struct livepage *);
-+struct livepage *alloclivepage(pagetable_t, pte_t *, int, struct swap *);
-+void             freelivepage(pte_t *pte);
-+void             freelivepages(pagetable_t);
-+uint             countlivepages(void);
++void            mempageinit();
++void *          mempageaddr(struct mempage *);
++struct mempage *allocmempage(pagetable_t, pte_t *, int, struct swap *);
++void            freemempage(pte_t *pte);
++void            freemempages(pagetable_t);
++uint            countmempages();
++void            mempagedump();
 +
 +
  // number of elements in fixed-size array
@@ -105,7 +106,7 @@ index c6bab15..2d9b419 100644
  {
    struct buf *bp;
 diff --git a/kernel/main.c b/kernel/main.c
-index f0d3171..5c36ac0 100644
+index f0d3171..66e5b44 100644
 --- a/kernel/main.c
 +++ b/kernel/main.c
 @@ -19,6 +19,8 @@ main()
@@ -113,16 +114,16 @@ index f0d3171..5c36ac0 100644
      kvminit();       // create kernel page table
      kvminithart();   // turn on paging
 +    swapinit();
-+    livepageinit();
++    mempageinit();
      procinit();      // process table
      trapinit();      // trap vectors
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..210a383
+index 0000000..50a5fcf
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,235 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -131,35 +132,35 @@ index 0000000..210a383
 +#include "spinlock.h"
 +#include "proc.h"
 +#include "defs.h"
-+#include "param.h"
++
++#define MAXPAGES 50
 +
 +enum state { FREE, ALLOCATED };
 +
-+uint pagecount = 0;
-+
-+
-+struct livepage {
++struct mempage {
 +	void *pa;
 +	pte_t	*pte;
 +	pagetable_t pagetable;
-+	struct livepage *next;
++	struct mempage *next;
 +} pages[MAXPAGES];
 +
 +
-+static struct livepage *free;
-+static struct livepage *head, *tail;
++static struct mempage *free;
++static struct mempage *head, *tail;
 +
 +struct spinlock swlock;
 +
++uint pagecount = 0;
++
 +void 
-+livepageinit() 
++mempageinit() 
 +{
 +	initlock(&swlock, "sw lock");
 +	head = NULL;
 +	tail = NULL;
 +	free = pages;
 +
-+	for (struct livepage *p = pages; p < &pages[MAXPAGES]; p++) {
++	for (struct mempage *p = pages; p < &pages[MAXPAGES]; p++) {
 +		p->next = p + 1;
 +	}
 +
@@ -169,17 +170,13 @@ index 0000000..210a383
 +
 +/* allocate an in-memory page and map it to va
 + return 0 on success -1 on failure */
-+struct livepage*
-+alloclivepage(pagetable_t pagetable, pte_t *pte, int flags, struct swap *oldsw) 
++struct mempage*
++allocmempage(pagetable_t pagetable, pte_t *pte, int flags, struct swap *oldsw) 
 +{
-+
-+	printf("alloc page\n");
-+
-+	struct livepage *p;
++	struct mempage *p;
 +
 +	acquire(&swlock);
 +	if (free) {
-+		printf("found free page\n");
 +		p = free;
 +		free = free->next;
 +
@@ -194,12 +191,10 @@ index 0000000..210a383
 +
 +		__sync_fetch_and_add(&pagecount, 1);
 +	} else {
-+		printf("swapping out page\n");
 +		/* allocate new swap */
 +		struct swap *sw = swapalloc();
 +
 +		if (!head) {
-+			printf("alive pages: %d\n", pagecount);
 +			panic("allocmempage: no page in linked list");
 +		}
 +		/* need to swap out a page */
@@ -244,13 +239,13 @@ index 0000000..210a383
 +}
 +
 +void *
-+livepageaddr(struct livepage *p)
++mempageaddr(struct mempage *p)
 +{
 +	return p->pa;
 +}
 +
 +static void
-+freelivepagenode(struct livepage *p, struct livepage *prev) 
++freemempagenode(struct mempage *p, struct mempage *prev) 
 +{
 +	pte_t *pte = p->pte;
 +	int flags = PTE_FLAGS(*pte);
@@ -287,7 +282,7 @@ index 0000000..210a383
 +
 +/* free mempage struct holding pte */
 +void 
-+freelivepage(pte_t *pte)
++freemempage(pte_t *pte)
 +{
 +	int flags = PTE_FLAGS(*pte);
 +	if (flags & PTE_S) {
@@ -298,13 +293,16 @@ index 0000000..210a383
 +		panic("Trying to free invalid page");
 +	}
 +
-+	struct livepage *prev, *p, *next;
++	struct mempage *prev, *p, *next;
 +	/* find the node with pte */
 +	acquire(&swlock);
 +	for (p = head, prev = NULL; p; p = next) {
 +		next = p->next;
 +		if (p->pte == pte) {
-+			freelivepagenode(p, prev);
++			freemempagenode(p, prev);
++			break;
++		} else {
++			prev = p;
 +		}
 +	}
 +	release(&swlock);
@@ -312,40 +310,35 @@ index 0000000..210a383
 +
 +/* free mempage struct holding pagetable */
 +void 
-+freelivepages(pagetable_t pagetable)
++freemempages(pagetable_t pagetable)
 +{
-+	struct livepage *prev, *p, *next;
-+
-+	printf("freelivepages %d >>\n", pagecount);
++	struct mempage *prev, *p, *next;
 +
 +	acquire(&swlock);
 +	/* free all the mempage with given pagetable */
 +	for (p = head, prev = NULL; p; p = next) {
 +		next = p->next;
 +		if (p->pagetable == pagetable) {
-+			freelivepagenode(p, prev);
++			freemempagenode(p, prev);
++		} else {
++			prev = p;
 +		}
 +	}
 +	release(&swlock);
-+
-+	printf("freelivepages %d <<\n", pagecount);
 +}
 +
 +
-+// count number of live pages used by current process
-+uint 
-+countlivepages(void)
++uint
++countmempages() 
 +{
-+	struct livepage *p;
++	struct mempage *p;
 +	struct proc *pp = myproc();
-+
-+	printf("countlivepages: pid: %d\n", pp->pid);
-+
 +	uint count = 0;
 +
 +	acquire(&swlock);
++	/* free all the mempage with given pagetable */
 +	for (p = head; p; p = p->next) {
-+		if (pp->pagetable == p->pagetable) {
++		if (p->pagetable == pp->pagetable) {
 +			count++;
 +		}
 +	}
@@ -353,17 +346,21 @@ index 0000000..210a383
 +
 +	return count;
 +}
-diff --git a/kernel/param.h b/kernel/param.h
-index 6624bff..152ff8d 100644
---- a/kernel/param.h
-+++ b/kernel/param.h
-@@ -11,3 +11,4 @@
- #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
- #define FSSIZE       2000  // size of file system in blocks
- #define MAXPATH      128   // maximum file path name
-+#define MAXPAGES     50    // maximum number of alive pages
++
++void
++mempagedump() 
++{
++	struct mempage *p;
++	printf("pagecount: %d\n", pagecount);
++	printf("mempage head: %p\n", head);
++	printf("mempage tail: %p\n", tail);
++	int i = 1;
++	for (p = head; p; p = p->next) {
++		printf("%d. pa: %p, pte: %p, pt: %p, next: %p\n", i++, p->pa, p->pte, p->pagetable, p->next);
++	}
++}
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..cd008b9 100644
+index 959b778..3601da8 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -25,6 +25,8 @@ extern char trampoline[]; // trampoline.S
@@ -439,39 +436,21 @@ index 959b778..cd008b9 100644
            return pid;
          }
          release(&pp->lock);
-@@ -652,6 +663,7 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+@@ -652,6 +663,8 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
    }
  }
  
 +extern uint pagecount;
++
  // Print a process listing to console.  For debugging.
  // Runs when user types ^P on console.
  // No lock to avoid wedging a stuck machine further.
-@@ -659,12 +671,12 @@ void
- procdump(void)
- {
-   static char *states[] = {
--  [UNUSED]    "unused",
--  [USED]      "used",
--  [SLEEPING]  "sleep ",
--  [RUNNABLE]  "runble",
--  [RUNNING]   "run   ",
--  [ZOMBIE]    "zombie"
-+  [UNUSED]    = "unused",
-+  [USED]      = "used",
-+  [SLEEPING]  = "sleep ",
-+  [RUNNABLE]  = "runble",
-+  [RUNNING]   = "run   ",
-+  [ZOMBIE]    = "zombie"
-   };
-   struct proc *p;
-   char *state;
-@@ -680,4 +692,6 @@ procdump(void)
+@@ -680,4 +693,6 @@ procdump(void)
      printf("%d %s %s", p->pid, state, p->name);
      printf("\n");
    }
 +
-+  printf("live page count: %d\n", pagecount);
++  mempagedump();
  }
 diff --git a/kernel/riscv.h b/kernel/riscv.h
 index 20a01db..fc8a6d0 100644
@@ -496,10 +475,10 @@ index 20a01db..fc8a6d0 100644
  // extract the three 9-bit page table indices from a virtual address.
 diff --git a/kernel/swap.c b/kernel/swap.c
 new file mode 100644
-index 0000000..345b8f9
+index 0000000..c0c418a
 --- /dev/null
 +++ b/kernel/swap.c
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,148 @@
 +#include "types.h"
 +#include "riscv.h"
 +#include "fs.h"
@@ -549,8 +528,6 @@ index 0000000..345b8f9
 +  struct run *r;
 +  struct swap *s;
 +
-+  printf("swapalloc\n");
-+
 +  acquire(&swapmem.lock);
 +  r = swapmem.freelist;
 +  if(!r){
@@ -574,7 +551,7 @@ index 0000000..345b8f9
 +  s = (struct swap*)r;
 +  if(s){
 +    memset((char*)s->blocknos, 0, sizeof(s->blocknos)); // fill with zeros
-+    s->ref_count = 1;
++    s->ref_count = 0;
 +  }
 +  return s;
 +}
@@ -585,8 +562,6 @@ index 0000000..345b8f9
 +void
 +swapfree(struct swap *s)
 +{
-+  printf("ref_count: %d\n", s->ref_count);
-+  __sync_fetch_and_add(&s->ref_count, -1);
 +  if (__sync_bool_compare_and_swap(&s->ref_count, 0, 0)) {
 +    uint *blockno;
 +    struct run *r;
@@ -607,7 +582,9 @@ index 0000000..345b8f9
 +    r->next = swapmem.freelist;
 +    swapmem.freelist = r;
 +    release(&swapmem.lock);
-+  } 
++  } else {
++    __sync_fetch_and_add(&s->ref_count, -1);
++  }
 +}
 +
 +// Swap out a given physical page src_pa to disk.
@@ -762,31 +739,30 @@ index bc5f356..06f1657 100644
 +#define SYS_livepgcnt      22
 +#define SYS_totallivepgcnt 23
 diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index 1de184e..a5bc9bc 100644
+index 1de184e..e03fc00 100644
 --- a/kernel/sysproc.c
 +++ b/kernel/sysproc.c
-@@ -89,3 +89,19 @@ sys_uptime(void)
+@@ -89,3 +89,18 @@ sys_uptime(void)
    release(&tickslock);
    return xticks;
  }
 +
 +extern uint pagecount;
 +
-+// return total number of live pages
-+uint64 
-+sys_totallivepgcnt(void) 
++uint64
++sys_livepgcnt(void)
 +{
-+  return __sync_fetch_and_add(&pagecount, 0);
++  return countmempages();
 +}
 +
-+// return total number of live pages used by process
-+uint64 
-+sys_livepgcnt(void) 
++
++uint64
++sys_totallivepgcnt(void)
 +{
-+  return countlivepages();
++  return pagecount;
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..707b554 100644
+index 512c850..944cae7 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
 @@ -65,6 +65,22 @@ usertrap(void)
@@ -806,14 +782,14 @@ index 512c850..707b554 100644
 +      setkilled(p);
 +    } else {
 +      /* swapped out page table entry */
-+      alloclivepage(p->pagetable, pte, flags, s);
++      allocmempage(p->pagetable, pte, flags, s);
 +    }
 +    
    } else if((which_dev = devintr()) != 0){
      // ok
    } else {
 diff --git a/kernel/vm.c b/kernel/vm.c
-index 9f69783..bab2b40 100644
+index 9f69783..60fcdb6 100644
 --- a/kernel/vm.c
 +++ b/kernel/vm.c
 @@ -5,6 +5,7 @@
@@ -840,9 +816,9 @@ index 9f69783..bab2b40 100644
 +  }
 +
 +  if ((*pte) & PTE_S) {
-+    struct livepage *p;
++    struct mempage *p;
 +    struct swap *s = (struct swap *)PTE2SW(*pte);
-+    if ((p = alloclivepage(page, pte, flags, s)) == 0) {
++    if ((p = allocmempage(page, pte, flags, s)) == 0) {
 +      return -1;
 +    }
 +  }
@@ -852,7 +828,7 @@ index 9f69783..bab2b40 100644
  // Create PTEs for virtual addresses starting at va that refer to
  // physical addresses starting at pa. va and size might not
  // be page-aligned. Returns 0 on success, -1 if walk() couldn't
-@@ -179,13 +201,22 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+@@ -179,13 +201,21 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
    for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
      if((pte = walk(pagetable, a, 0)) == 0)
        panic("uvmunmap: walk");
@@ -866,24 +842,23 @@ index 9f69783..bab2b40 100644
 -      kfree((void*)pa);
 +      int flags = PTE_FLAGS(*pte);
 +      if (flags & PTE_S) {
-+        printf("calling swapfree\n");
 +        swapfree((struct swap *)PTE2SW(*pte));
 +      } else {
 +        uint64 pa = PTE2PA(*pte);
 +        // may be freed already by a call to freemempages
 +        if (pa) {
-+          freelivepage(pte);
++          freemempage(pte);
 +        }
 +      }
      }
      *pte = 0;
    }
-@@ -210,13 +241,20 @@ uvmcreate()
+@@ -210,13 +240,20 @@ uvmcreate()
  void
  uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  {
 -  char *mem;
-+  struct livepage *p;
++  struct mempage *p;
  
    if(sz >= PGSIZE)
      panic("uvmfirst: more than a page");
@@ -891,18 +866,18 @@ index 9f69783..bab2b40 100644
 +  pte_t *pte = walk(pagetable, 0, 1);
 +  int flags = PTE_W|PTE_R|PTE_X|PTE_U;
 +
-+  if((p = alloclivepage(pagetable, pte, flags, NULL)) == 0) {
++  if((p = allocmempage(pagetable, pte, flags, NULL)) == 0) {
 +    panic("uvmfirst: couldn't allocate mempage");
 +  }
 +
-+  char *mem = livepageaddr(p);
++  char *mem = mempageaddr(p);
 +
    memset(mem, 0, PGSIZE);
 -  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
    memmove(mem, src, sz);
  }
  
-@@ -225,7 +263,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+@@ -225,7 +262,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  uint64
  uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  {
@@ -910,7 +885,7 @@ index 9f69783..bab2b40 100644
    uint64 a;
  
    if(newsz < oldsz)
-@@ -233,17 +270,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+@@ -233,17 +269,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  
    oldsz = PGROUNDUP(oldsz);
    for(a = oldsz; a < newsz; a += PGSIZE){
@@ -924,16 +899,16 @@ index 9f69783..bab2b40 100644
 -      kfree(mem);
 +    pte_t *pte = walk(pagetable, a, 1);
 +    int flags = PTE_R|PTE_U|xperm;
-+    struct livepage *p;
-+    if ((p = alloclivepage(pagetable, pte, flags, NULL)) == 0) {
++    struct mempage *p;
++    if ((p = allocmempage(pagetable, pte, flags, NULL)) == 0) {
        uvmdealloc(pagetable, a, oldsz);
        return 0;
      }
-+    memset(livepageaddr(p), 0, PGSIZE);
++    memset(mempageaddr(p), 0, PGSIZE);
    }
    return newsz;
  }
-@@ -291,8 +325,13 @@ freewalk(pagetable_t pagetable)
+@@ -291,8 +324,13 @@ freewalk(pagetable_t pagetable)
  void
  uvmfree(pagetable_t pagetable, uint64 sz)
  {
@@ -941,14 +916,14 @@ index 9f69783..bab2b40 100644
 +  if(sz > 0) {
 +    // free all mempages associated with pagetable to void having to iterate
 +    // the list everytime
-+    freelivepages(pagetable);
++    freemempages(pagetable);
 +    // free remaining possibly swap pages
      uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
 +  }
    freewalk(pagetable);
  }
  
-@@ -308,22 +347,31 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+@@ -308,22 +346,31 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
    pte_t *pte;
    uint64 pa, i;
    uint flags;
@@ -979,15 +954,15 @@ index 9f69783..bab2b40 100644
 +      *new_pte = *pte;
 +      swapref(s);
 +    } else {
-+      struct livepage *p;
-+      if((p = alloclivepage(new, new_pte, flags, NULL)) == 0)
++      struct mempage *p;
++      if((p = allocmempage(new, new_pte, flags, NULL)) == 0)
 +        goto err;
-+      memmove(livepageaddr(p), (char*)pa, PGSIZE);
++      memmove(mempageaddr(p), (char*)pa, PGSIZE);
 +    }
    }
    return 0;
  
-@@ -353,6 +401,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+@@ -353,6 +400,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
  {
    uint64 n, va0, pa0;
  
@@ -998,7 +973,7 @@ index 9f69783..bab2b40 100644
    while(len > 0){
      va0 = PGROUNDDOWN(dstva);
      pa0 = walkaddr(pagetable, va0);
-@@ -378,6 +430,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+@@ -378,6 +429,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
  {
    uint64 n, va0, pa0;
  
@@ -1009,7 +984,7 @@ index 9f69783..bab2b40 100644
    while(len > 0){
      va0 = PGROUNDDOWN(srcva);
      pa0 = walkaddr(pagetable, va0);
-@@ -405,6 +461,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+@@ -405,6 +460,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
    uint64 n, va0, pa0;
    int got_null = 0;
  
@@ -1035,10 +1010,10 @@ index 384e75f..a0fd173 100644
  print(const char *s)
 diff --git a/user/test1.c b/user/test1.c
 new file mode 100644
-index 0000000..e3ae698
+index 0000000..120c55d
 --- /dev/null
 +++ b/user/test1.c
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,64 @@
 +#include "kernel/types.h"
 +#include "user/user.h"
 +
@@ -1051,19 +1026,24 @@ index 0000000..e3ae698
 +  }
 +
 +  int npages = atoi(argv[1]);
-+  void **pages = malloc(sizeof(void*) * npages);
++  void **pages = 0;
++
++  if (npages) {
++    pages = malloc(sizeof(void *) * npages);
++  }
 +
 +  for (int i = 0; i < npages; i++) {
++    // malloc usually calls sbrk with 4096 * 16
 +    pages[i] = malloc(4096);
 +    memset(pages[i], 0, 4096);
 +  }
 +
-+	printf("live pages used by process: %d, pid: %d\n", livepgcnt(), getpid());
-+	printf("total live pages: %d\n", totallivepgcnt());
-+  
++  printf("live pages used by process: %d, pid: %d\n", livepgcnt(), getpid());
++  printf("total live pages: %d\n", totallivepgcnt());
++
 +  for (int i = 0; i < T; i++) {
 +    for (int j = 0; j < npages; j++) {
-+      int *v = (int *) pages[j];
++      int *v = (int *)pages[j];
 +      for (int k = 0; k < 4096 / sizeof(int); k++) {
 +        v[k] = (v[k] + 1) % 1999;
 +        // printf("%d. accessing page: %p, addr: %p\n", k, pages[i], &v[k]);
@@ -1074,7 +1054,7 @@ index 0000000..e3ae698
 +  int matched = 1;
 +  for (int i = 0; i < T; i++) {
 +    for (int j = 0; j < npages; j++) {
-+      int *v = (int *) pages[j];
++      int *v = (int *)pages[j];
 +      for (int k = 0; k < 4096 / sizeof(int); k++) {
 +        if (v[k] != T) {
 +          matched = 0;
@@ -1082,10 +1062,13 @@ index 0000000..e3ae698
 +      }
 +    }
 +  }
-+  for (int i = 0; i < npages; i++) {
-+    free(pages[i]);
++
++  if (npages) {
++    for (int i = 0; i < npages; i++) {
++      free(pages[i]);
++    }
++    free(pages);
 +  }
-+  free(pages);
 +
 +  if (matched) {
 +    printf("memory test passed\n");
@@ -1095,6 +1078,7 @@ index 0000000..e3ae698
 +
 +  return 0;
 +}
+\ No newline at end of file
 diff --git a/user/test2.c b/user/test2.c
 new file mode 100644
 index 0000000..fd72d29
