@@ -107,7 +107,7 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..518b18f
+index 0000000..fac584c
 --- /dev/null
 +++ b/kernel/page.c
 @@ -0,0 +1,191 @@
@@ -177,18 +177,19 @@ index 0000000..518b18f
 +		/* allocate new swap */
 +		struct swap *sw = swapalloc();
 +
++		if (!head) {
++			panic("allocmempage: no page in linked list");
++		}
 +		/* need to swap out a page */
 +		p = head;
 +		head = head->next;
 +
 +		release(&swlock);
-+		printf("swapping out %p>>\n", sw);
 +		swapout(sw, p->pa);
 +
 +		int flags = PTE_FLAGS(*p->pte);
 +		*(p->pte) = SW2PTE(sw) | flags | PTE_S;
 +		*(p->pte) &= ~(PTE_V);
-+		printf("swapping out %p<<\n", sw);
 +
 +		acquire(&swlock);
 +	}
@@ -201,6 +202,7 @@ index 0000000..518b18f
 +		head = p;
 +	}
 +	tail = p;
++	tail->next = NULL;
 +
 +	
 +	*pte = PA2PTE(p->pa) | flags | PTE_V;
@@ -213,12 +215,8 @@ index 0000000..518b18f
 +	release(&swlock);
 +
 +	if (oldsw) {
-+		printf("swap in %p>>\n", oldsw);
 +		swapin(p->pa, oldsw);
-+		printf("swap in %p<<\n", oldsw);
-+		printf("swap free >>\n");
 +		swapfree(oldsw);
-+		printf("swap free <<\n");
 +	}
 +	return p;
 +}
@@ -276,10 +274,11 @@ index 0000000..518b18f
 +		panic("Trying to free invalid page");
 +	}
 +
-+	struct mempage *prev, *p;
++	struct mempage *prev, *p, *next;
 +	/* find the node with pte */
 +	acquire(&swlock);
-+	for (p = head, prev = NULL; p; p = p->next) {
++	for (p = head, prev = NULL; p; p = next) {
++		next = p->next;
 +		if (p->pte == pte) {
 +			freemempagenode(p, prev);
 +		}
@@ -291,11 +290,12 @@ index 0000000..518b18f
 +void 
 +freemempages(pagetable_t pagetable)
 +{
-+	struct mempage *prev, *p;
++	struct mempage *prev, *p, *next;
 +
 +	acquire(&swlock);
 +	/* free all the mempage with given pagetable */
-+	for (p = head, prev = NULL; p; p = p->next) {
++	for (p = head, prev = NULL; p; p = next) {
++		next = p->next;
 +		if (p->pte == pagetable) {
 +			freemempagenode(p, prev);
 +		}
@@ -303,7 +303,7 @@ index 0000000..518b18f
 +	release(&swlock);
 +}
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..ea71566 100644
+index 959b778..bf5bd54 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -25,6 +25,8 @@ extern char trampoline[]; // trampoline.S
@@ -323,18 +323,40 @@ index 959b778..ea71566 100644
    for(p = proc; p < &proc[NPROC]; p++) {
        initlock(&p->lock, "proc");
        p->state = UNUSED;
-@@ -288,12 +291,19 @@ fork(void)
+@@ -158,8 +161,6 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -210,9 +211,11 @@ proc_pagetable(struct proc *p)
+ void
+ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+-  uvmfree(pagetable, sz);
++  if (pagetable) {
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmunmap(pagetable, TRAPFRAME, 1, 0);
++    uvmfree(pagetable, sz);
++  }
+ }
+ 
+ // a user program that calls exec("/init")
+@@ -288,12 +291,17 @@ fork(void)
      return -1;
    }
  
 +  // release lock so that swapin and swapout can be called
 +  release(&np->lock);
-+
    // Copy user memory from parent to child.
    if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
      freeproc(np);
 -    release(&np->lock);
-+    pop_off();
      return -1;
    }
 +
@@ -344,6 +366,19 @@ index 959b778..ea71566 100644
    np->sz = p->sz;
  
    // copy saved user registers.
+@@ -414,9 +422,12 @@ wait(uint64 addr)
+             release(&wait_lock);
+             return -1;
+           }
++          pagetable_t pt = pp->pagetable;
++          uint64 sz = pp->sz;
+           freeproc(pp);
+           release(&pp->lock);
+           release(&wait_lock);
++          proc_freepagetable(pt, sz);
+           return pid;
+         }
+         release(&pp->lock);
 diff --git a/kernel/riscv.h b/kernel/riscv.h
 index 20a01db..fc8a6d0 100644
 --- a/kernel/riscv.h
@@ -519,6 +554,55 @@ index 0000000..c0c418a
 +    brelse(bp);
 +  }
 +}
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..a544787 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -1,22 +1,23 @@
+ // System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++#define SYS_fork          1
++#define SYS_exit          2
++#define SYS_wait          3
++#define SYS_pipe          4
++#define SYS_read          5
++#define SYS_kill          6
++#define SYS_exec          7
++#define SYS_fstat         8
++#define SYS_chdir         9
++#define SYS_dup           10
++#define SYS_getpid        11
++#define SYS_sbrk          12
++#define SYS_sleep         13
++#define SYS_uptime        14
++#define SYS_open          15
++#define SYS_write         16
++#define SYS_mknod         17
++#define SYS_unlink        18
++#define SYS_link          19
++#define SYS_mkdir         20
++#define SYS_close         21
++#define SYS_livepagecount 22
 diff --git a/kernel/trap.c b/kernel/trap.c
 index 512c850..944cae7 100644
 --- a/kernel/trap.c
@@ -547,7 +631,7 @@ index 512c850..944cae7 100644
      // ok
    } else {
 diff --git a/kernel/vm.c b/kernel/vm.c
-index 9f69783..5f5d44d 100644
+index 9f69783..60fcdb6 100644
 --- a/kernel/vm.c
 +++ b/kernel/vm.c
 @@ -5,6 +5,7 @@
@@ -558,7 +642,41 @@ index 9f69783..5f5d44d 100644
  
  /*
   * the kernel's page table.
-@@ -184,8 +185,18 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+@@ -135,6 +136,27 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+     panic("kvmmap");
+ }
+ 
++// ensure page associated with va is loaded into memory
++static int
++uvmloadpage(pagetable_t page, uint64 va) 
++{
++  pte_t *pte = walk(page, va, 0);
++  int flags = PTE_FLAGS(*pte);
++
++  if (((*pte) & PTE_V) == 0 && ((*pte) & PTE_S) == 0) {
++    panic("uvmloadpage: page invalid");
++  }
++
++  if ((*pte) & PTE_S) {
++    struct mempage *p;
++    struct swap *s = (struct swap *)PTE2SW(*pte);
++    if ((p = allocmempage(page, pte, flags, s)) == 0) {
++      return -1;
++    }
++  }
++  return 0;
++}
++
+ // Create PTEs for virtual addresses starting at va that refer to
+ // physical addresses starting at pa. va and size might not
+ // be page-aligned. Returns 0 on success, -1 if walk() couldn't
+@@ -179,13 +201,21 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
++    if((*pte & PTE_V) == 0 && (*pte & PTE_S) == 0)
+       panic("uvmunmap: not mapped");
      if(PTE_FLAGS(*pte) == PTE_V)
        panic("uvmunmap: not a leaf");
      if(do_free){
@@ -566,9 +684,7 @@ index 9f69783..5f5d44d 100644
 -      kfree((void*)pa);
 +      int flags = PTE_FLAGS(*pte);
 +      if (flags & PTE_S) {
-+    		printf("swap free >>\n");
-+        swapfree((struct swap *)PTE2PA(*pte));
-+    		printf("swap free >>\n");
++        swapfree((struct swap *)PTE2SW(*pte));
 +      } else {
 +        uint64 pa = PTE2PA(*pte);
 +        // may be freed already by a call to freemempages
@@ -579,7 +695,7 @@ index 9f69783..5f5d44d 100644
      }
      *pte = 0;
    }
-@@ -210,13 +221,20 @@ uvmcreate()
+@@ -210,13 +240,20 @@ uvmcreate()
  void
  uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  {
@@ -603,7 +719,7 @@ index 9f69783..5f5d44d 100644
    memmove(mem, src, sz);
  }
  
-@@ -225,7 +243,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+@@ -225,7 +262,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  uint64
  uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  {
@@ -611,7 +727,7 @@ index 9f69783..5f5d44d 100644
    uint64 a;
  
    if(newsz < oldsz)
-@@ -233,17 +250,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+@@ -233,17 +269,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  
    oldsz = PGROUNDUP(oldsz);
    for(a = oldsz; a < newsz; a += PGSIZE){
@@ -634,7 +750,7 @@ index 9f69783..5f5d44d 100644
    }
    return newsz;
  }
-@@ -291,8 +305,13 @@ freewalk(pagetable_t pagetable)
+@@ -291,8 +324,13 @@ freewalk(pagetable_t pagetable)
  void
  uvmfree(pagetable_t pagetable, uint64 sz)
  {
@@ -649,7 +765,7 @@ index 9f69783..5f5d44d 100644
    freewalk(pagetable);
  }
  
-@@ -308,7 +327,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+@@ -308,22 +346,31 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
    pte_t *pte;
    uint64 pa, i;
    uint flags;
@@ -657,7 +773,9 @@ index 9f69783..5f5d44d 100644
  
    for(i = 0; i < sz; i += PGSIZE){
      if((pte = walk(old, i, 0)) == 0)
-@@ -317,13 +335,23 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
++    if((*pte & PTE_V) == 0 && (*pte & PTE_S) == 0)
        panic("uvmcopy: page not present");
      pa = PTE2PA(*pte);
      flags = PTE_FLAGS(*pte);
@@ -674,7 +792,7 @@ index 9f69783..5f5d44d 100644
 +
 +    if (flags & PTE_S) {
 +      // increase ref count of swap
-+      struct swap *s = (struct swap *)pa;
++      struct swap *s = (struct swap *)PTE2SW(*pte);
 +      *new_pte = *pte;
 +      swapref(s);
 +    } else {
@@ -686,8 +804,41 @@ index 9f69783..5f5d44d 100644
    }
    return 0;
  
+@@ -353,6 +400,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
++  if (uvmloadpage(pagetable, dstva) < 0) {
++    return -1;
++  }
++
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+     pa0 = walkaddr(pagetable, va0);
+@@ -378,6 +429,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
++  if (uvmloadpage(pagetable, srcva) < 0) {
++    return -1;
++  }
++
+   while(len > 0){
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+@@ -405,6 +460,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+   uint64 n, va0, pa0;
+   int got_null = 0;
+ 
++  if (uvmloadpage(pagetable, srcva) < 0) {
++    return -1;
++  }
++
+   while(got_null == 0 && max > 0){
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
 diff --git a/user/forktest.c b/user/forktest.c
-index 384e75f..913d9fe 100644
+index 384e75f..a0fd173 100644
 --- a/user/forktest.c
 +++ b/user/forktest.c
 @@ -5,7 +5,7 @@
@@ -695,22 +846,43 @@ index 384e75f..913d9fe 100644
  #include "user/user.h"
  
 -#define N  1000
-+#define N  15
++#define N 1000
  
  void
  print(const char *s)
-@@ -28,10 +28,10 @@ forktest(void)
-       exit(0);
-   }
- 
--  if(n == N){
--    print("fork claimed to work N times!\n");
--    exit(1);
--  }
-+  // if(n == N){
-+  //   print("fork claimed to work N times!\n");
-+  //   exit(1);
-+  // }
- 
-   for(; n > 0; n--){
-     if(wait(0) < 0){
+diff --git a/user/test1.c b/user/test1.c
+new file mode 100644
+index 0000000..262b740
+--- /dev/null
++++ b/user/test1.c
+@@ -0,0 +1,3 @@
++int main() {
++	
++}
+diff --git a/user/test2.c b/user/test2.c
+new file mode 100644
+index 0000000..262b740
+--- /dev/null
++++ b/user/test2.c
+@@ -0,0 +1,3 @@
++int main() {
++	
++}
+diff --git a/user/test3.c b/user/test3.c
+new file mode 100644
+index 0000000..262b740
+--- /dev/null
++++ b/user/test3.c
+@@ -0,0 +1,3 @@
++int main() {
++	
++}
+diff --git a/user/test4.c b/user/test4.c
+new file mode 100644
+index 0000000..262b740
+--- /dev/null
++++ b/user/test4.c
+@@ -0,0 +1,3 @@
++int main() {
++	
++}
