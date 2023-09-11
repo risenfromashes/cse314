@@ -40,7 +40,7 @@ index 0000000..57dc239
 +-I.
 \ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..8726bfa 100644
+index a3c962b..e935487 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -8,6 +8,8 @@ struct spinlock;
@@ -76,7 +76,7 @@ index a3c962b..8726bfa 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
  
-@@ -185,5 +197,16 @@ void            virtio_disk_init(void);
+@@ -185,5 +197,17 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
@@ -89,6 +89,7 @@ index a3c962b..8726bfa 100644
 +void            freemempages(pagetable_t);
 +uint            countmempages();
 +void            mempagedump();
++int             mempagecopy(pte_t *, uint64, char *);
 +
 +
  // number of elements in fixed-size array
@@ -130,10 +131,10 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..e330e73
+index 0000000..ea9a39c
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,263 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -219,8 +220,7 @@ index 0000000..e330e73
 +		acquire(&swlock);
 +
 +		int flags = PTE_FLAGS(*p->pte);
-+		*(p->pte) = SW2PTE(sw) | flags | PTE_S;
-+		*(p->pte) &= ~(PTE_V);
++		*(p->pte) = (SW2PTE(sw) | flags | PTE_S) & ~(PTE_V);
 +
 +	}
 +
@@ -237,8 +237,7 @@ index 0000000..e330e73
 +	}
 +	tail = p;
 +	
-+	*pte = PA2PTE(p->pa) | flags | PTE_V;
-+	*pte &= ~(PTE_S); // not swapped out
++	*pte = (PA2PTE(p->pa) | flags | PTE_V) & ~(PTE_S);
 +
 +	p->pte = pte;
 +	p->pagetable = pagetable;
@@ -386,28 +385,24 @@ index 0000000..e330e73
 +		printf("%d. pa: %p, pte: %p, pt: %p, next: %p\n", i++, p->pa, p->pte, p->pagetable, p->next);
 +	}
 +}
++
++int
++mempagecopy(pte_t *pte, uint64 pa, char *dst) 
++{
++	acquire(&swlock);
++	if (PTE2PA(*pte) != pa) {
++		release(&swlock);
++		return -1;
++	}
++	memmove(dst, (char *)pa, PGSIZE);
++	release(&swlock);
++	return 0;
++}
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..6584d7f 100644
+index 959b778..14d44e8 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -25,6 +25,8 @@ extern char trampoline[]; // trampoline.S
- // memory model when using p->parent.
- // must be acquired before any p->lock.
- struct spinlock wait_lock;
-+// a lock to disable scheduling while releasing p->lock
-+struct spinlock sched_lock;
- 
- // Allocate a page for each process's kernel stack.
- // Map it high in memory, followed by an invalid
-@@ -51,6 +53,7 @@ procinit(void)
-   
-   initlock(&pid_lock, "nextpid");
-   initlock(&wait_lock, "wait_lock");
-+  initlock(&sched_lock, "shed_lock");
-   for(p = proc; p < &proc[NPROC]; p++) {
-       initlock(&p->lock, "proc");
-       p->state = UNUSED;
-@@ -158,8 +161,6 @@ freeproc(struct proc *p)
+@@ -158,8 +158,6 @@ freeproc(struct proc *p)
    if(p->trapframe)
      kfree((void*)p->trapframe);
    p->trapframe = 0;
@@ -416,7 +411,7 @@ index 959b778..6584d7f 100644
    p->pagetable = 0;
    p->sz = 0;
    p->pid = 0;
-@@ -210,9 +211,11 @@ proc_pagetable(struct proc *p)
+@@ -210,9 +208,11 @@ proc_pagetable(struct proc *p)
  void
  proc_freepagetable(pagetable_t pagetable, uint64 sz)
  {
@@ -431,7 +426,7 @@ index 959b778..6584d7f 100644
  }
  
  // a user program that calls exec("/init")
-@@ -288,12 +291,17 @@ fork(void)
+@@ -288,12 +288,17 @@ fork(void)
      return -1;
    }
  
@@ -450,7 +445,7 @@ index 959b778..6584d7f 100644
    np->sz = p->sz;
  
    // copy saved user registers.
-@@ -414,9 +422,12 @@ wait(uint64 addr)
+@@ -414,9 +419,12 @@ wait(uint64 addr)
              release(&wait_lock);
              return -1;
            }
@@ -463,7 +458,7 @@ index 959b778..6584d7f 100644
            return pid;
          }
          release(&pp->lock);
-@@ -652,6 +663,10 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+@@ -652,6 +660,10 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
    }
  }
  
@@ -474,7 +469,7 @@ index 959b778..6584d7f 100644
  // Print a process listing to console.  For debugging.
  // Runs when user types ^P on console.
  // No lock to avoid wedging a stuck machine further.
-@@ -680,4 +695,9 @@ procdump(void)
+@@ -680,4 +692,9 @@ procdump(void)
      printf("%d %s %s", p->pid, state, p->name);
      printf("\n");
    }
@@ -821,10 +816,10 @@ index 1de184e..9ce23cb 100644
 +  return swapcount;
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..a0f3603 100644
+index 512c850..8dc1a60 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
-@@ -65,6 +65,28 @@ usertrap(void)
+@@ -65,6 +65,36 @@ usertrap(void)
      intr_on();
  
      syscall();
@@ -832,21 +827,29 @@ index 512c850..a0f3603 100644
 +    // page fault
 +    uint64 va = r_stval();
 +    pte_t *pte = walk(p->pagetable, va, 0);
-+    int flags = PTE_FLAGS(*pte);
-+    struct swap *s = (struct swap *)PTE2SW(*pte);
-+    
-+    if (!(flags & PTE_S)) {
-+      printf("usertrap(): unexpected pagefault. pid=%d\n", p->pid);
++
++    if (pte == 0) {
++      printf("usertrap(): segmentation fault. pid=%d\n", p->pid);
 +      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
 +      setkilled(p);
 +    } else {
-+      /* swapped out page table entry */
-+      // printf("Page fault at address: %p, swap: %p\n", va, s);
-+      struct mempage *mp;
-+      if ((mp = allocmempage(p->pagetable, pte, flags, s)) == 0) {
-+        printf("usertrap(): couldn't allocate mempage. pid=%d\n", p->pid);
++      
++      int flags = PTE_FLAGS(*pte);
++      struct swap *s = (struct swap *)PTE2SW(*pte);
++    
++      if (!(flags & PTE_S)) {
++        printf("usertrap(): unexpected pagefault. pid=%d\n", p->pid);
 +        printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
 +        setkilled(p);
++      } else {
++        /* swapped out page table entry */
++        // printf("Page fault at address: %p, swap: %p\n", va, s);
++        struct mempage *mp;
++        if ((mp = allocmempage(p->pagetable, pte, flags, s)) == 0) {
++          printf("usertrap(): couldn't allocate mempage. pid=%d\n", p->pid);
++          printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++          setkilled(p);
++        }
 +      }
 +    }
 +    
@@ -854,7 +857,7 @@ index 512c850..a0f3603 100644
      // ok
    } else {
 diff --git a/kernel/vm.c b/kernel/vm.c
-index 9f69783..0656a5e 100644
+index 9f69783..487bfca 100644
 --- a/kernel/vm.c
 +++ b/kernel/vm.c
 @@ -5,6 +5,7 @@
@@ -960,19 +963,20 @@ index 9f69783..0656a5e 100644
    uint64 a;
  
    if(newsz < oldsz)
-@@ -233,17 +272,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+@@ -233,17 +272,18 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  
    oldsz = PGROUNDUP(oldsz);
    for(a = oldsz; a < newsz; a += PGSIZE){
 -    mem = kalloc();
 -    if(mem == 0){
--      uvmdealloc(pagetable, a, oldsz);
--      return 0;
--    }
++    pte_t *pte = walk(pagetable, a, 1);
++    if (pte == 0) {
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+     }
 -    memset(mem, 0, PGSIZE);
 -    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
 -      kfree(mem);
-+    pte_t *pte = walk(pagetable, a, 1);
 +    int flags = PTE_R|PTE_U|xperm;
 +    struct mempage *p;
 +    if ((p = allocmempage(pagetable, pte, flags, NULL)) == 0) {
@@ -984,7 +988,7 @@ index 9f69783..0656a5e 100644
    }
    return newsz;
  }
-@@ -291,8 +327,13 @@ freewalk(pagetable_t pagetable)
+@@ -291,8 +331,13 @@ freewalk(pagetable_t pagetable)
  void
  uvmfree(pagetable_t pagetable, uint64 sz)
  {
@@ -999,7 +1003,7 @@ index 9f69783..0656a5e 100644
    freewalk(pagetable);
  }
  
-@@ -308,22 +349,43 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+@@ -308,22 +353,41 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
    pte_t *pte;
    uint64 pa, i;
    uint flags;
@@ -1036,21 +1040,19 @@ index 9f69783..0656a5e 100644
 +      struct mempage *p;
 +      if((p = allocmempage(new, new_pte, flags, NULL)) == 0)
 +        goto err;
-+      if (pa != PTE2PA(*pte)) {
-+        // the page has already been swapped out
++
++      if (mempagecopy(pte, pa, mempageaddr(p)) != 0) {
 +        freemempagenode(p);
 +        struct swap *s = (struct swap *)PTE2SW(*pte);
 +        *new_pte = *pte;
 +        swapref(s);
 +        __sync_fetch_and_add(&pagecount, 1);
-+      } else {
-+        memmove(mempageaddr(p), (char*)pa, PGSIZE);
 +      }
 +    }
    }
    return 0;
  
-@@ -353,6 +415,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+@@ -353,6 +417,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
  {
    uint64 n, va0, pa0;
  
@@ -1061,7 +1063,7 @@ index 9f69783..0656a5e 100644
    while(len > 0){
      va0 = PGROUNDDOWN(dstva);
      pa0 = walkaddr(pagetable, va0);
-@@ -378,6 +444,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+@@ -378,6 +446,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
  {
    uint64 n, va0, pa0;
  
@@ -1072,7 +1074,7 @@ index 9f69783..0656a5e 100644
    while(len > 0){
      va0 = PGROUNDDOWN(srcva);
      pa0 = walkaddr(pagetable, va0);
-@@ -405,6 +475,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+@@ -405,6 +477,10 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
    uint64 n, va0, pa0;
    int got_null = 0;
  
