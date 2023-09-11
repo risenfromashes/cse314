@@ -1,17 +1,18 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..2c3a41b 100644
+index 39a99d7..8de562a 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -24,6 +24,8 @@ OBJS = \
+@@ -24,6 +24,9 @@ OBJS = \
    $K/sleeplock.o \
    $K/file.o \
    $K/pipe.o \
 +  $K/swap.o \
 +  $K/page.o \
++  $K/pgheap.o \
    $K/exec.o \
    $K/sysfile.o \
    $K/kernelvec.o \
-@@ -132,6 +134,10 @@ UPROGS=\
+@@ -132,6 +135,10 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
@@ -22,7 +23,7 @@ index 39a99d7..2c3a41b 100644
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -153,7 +159,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+@@ -153,7 +160,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
  	then echo "-gdb tcp::$(GDBPORT)"; \
  	else echo "-s -p $(GDBPORT)"; fi)
  ifndef CPUS
@@ -40,7 +41,7 @@ index 0000000..57dc239
 +-I.
 \ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..e935487 100644
+index a3c962b..b1e6443 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -8,6 +8,8 @@ struct spinlock;
@@ -76,7 +77,7 @@ index a3c962b..e935487 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
  
-@@ -185,5 +197,17 @@ void            virtio_disk_init(void);
+@@ -185,5 +197,23 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
@@ -90,6 +91,12 @@ index a3c962b..e935487 100644
 +uint            countmempages();
 +void            mempagedump();
 +int             mempagecopy(pte_t *, uint64, char *);
++void            mempagetick(void);
++
++//pgheap.c
++void            pgheapupdate(void);
++void            pgheappush(struct mempage *p);
++struct mempage *pgheappop(void);
 +
 +
  // number of elements in fixed-size array
@@ -131,10 +138,10 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..abf8e1a
+index 0000000..6ad23af
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,293 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -143,17 +150,12 @@ index 0000000..abf8e1a
 +#include "spinlock.h"
 +#include "proc.h"
 +#include "defs.h"
-+
-+#define MAXPAGES 50
++#include "param.h"
++#include "page.h"
 +
 +enum state { FREE, ALLOCATED };
 +
-+struct mempage {
-+	void *pa;
-+	pte_t	*pte;
-+	pagetable_t pagetable;
-+	struct mempage *next, *prev;
-+} pages[MAXPAGES];
++struct mempage pages[MAXPAGES];
 +
 +
 +static struct mempage *free;
@@ -163,6 +165,21 @@ index 0000000..abf8e1a
 +
 +uint livepagecount = 0;
 +extern uint pagecount;
++
++static void
++unlinkmempagenode(struct mempage *p) 
++{
++	if (p->prev) {
++		p->prev->next = p->next;
++	} else {
++		head = p->next;
++	}
++	if (p->next) {
++		p->next->prev = p->prev;
++	} else {
++		tail = p->prev;
++	}
++}
 +
 +void 
 +mempageinit() 
@@ -210,10 +227,15 @@ index 0000000..abf8e1a
 +		if (!head) {
 +			panic("allocmempage: no page in linked list");
 +		}
++
 +		/* need to swap out a page */
++#ifdef AGING
++		p = pgheappop();
++#else
 +		p = head;
-+		head = head->next;
-+		head->prev = NULL;
++#endif
++
++		unlinkmempagenode(p);
 +
 +		release(&swlock);
 +		swapout(sw, p->pa);
@@ -231,6 +253,12 @@ index 0000000..abf8e1a
 +
 +	p->prev = tail;
 +	p->next = NULL;
++	p->age = 0;
++
++#ifdef AGING
++	p->age = INIT_AGE;
++	pgheappush(p);
++#endif	
 +
 +	if (tail) {
 +		tail->next = p;
@@ -279,16 +307,7 @@ index 0000000..abf8e1a
 +	*pte = flags;
 +
 +	/* remove linked list node */
-+	if (p->prev) {
-+		p->prev->next = p->next;
-+	} else {
-+		head = p->next;
-+	}
-+	if (p->next) {
-+		p->next->prev = p->prev;
-+	} else {
-+		tail = p->prev;
-+	}
++	unlinkmempagenode(p);
 +
 +	/* add to free list */
 +	p->next = free;
@@ -400,6 +419,172 @@ index 0000000..abf8e1a
 +	return 0;
 +}
 +
++
++// called on each clock tick
++void
++mempagetick(void) 
++{
++  acquire(&swlock);
++  for (struct mempage *p = head; p; p = p->next) {
++		// check if accessed in this clock tick
++    int accessed = *(p->pte) & PTE_A;
++    p->age = INC_AGE(p->age, accessed);
++		// reset flag
++		*(p->pte) &= ~(PTE_A);
++  }
++  pgheapupdate();
++  release(&swlock);
++}
+diff --git a/kernel/page.h b/kernel/page.h
+new file mode 100644
+index 0000000..a7928e4
+--- /dev/null
++++ b/kernel/page.h
+@@ -0,0 +1,11 @@
++struct mempage {
++	void *pa;
++	pte_t	*pte;
++	pagetable_t pagetable;
++	struct mempage *next, *prev;
++	uint64 age;
++};
++
++
++#define INIT_AGE (1L << 63)
++#define INC_AGE(old, acc) ((((uint64)acc) << 63) | (old >> 1))
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..59b7fe8 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,5 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define MAXPAGES     50    // max live pages
++#define AGING              // enable aging page replacement algorithm
+diff --git a/kernel/pgheap.c b/kernel/pgheap.c
+new file mode 100644
+index 0000000..82358e2
+--- /dev/null
++++ b/kernel/pgheap.c
+@@ -0,0 +1,117 @@
++#include "stddef.h"
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "param.h"
++#include "page.h"
++
++struct {
++  struct mempage *pages[MAXPAGES];
++  uint size;
++} heap;
++
++static void 
++swap(struct mempage **a, struct mempage **b) 
++{
++  struct mempage *temp = *a;
++  *a = *b;
++  *b = temp;
++}
++
++static void 
++heapify_up(int idx) 
++{
++  if (idx == 0) {
++    return;
++  }
++
++  int p = (idx - 1) / 2;
++
++  if (idx > 0 &&
++      heap.pages[idx]->age < heap.pages[p]->age) {
++    swap(&heap.pages[idx], &heap.pages[p]);
++    heapify_up(p);
++  }
++}
++
++static void 
++insert(struct mempage *p) 
++{
++  if (heap.size >= MAXPAGES) {
++    panic("pageheap: heap is full");
++  }
++
++  heap.pages[heap.size] = p;
++  heapify_up(heap.size);
++  heap.size++;
++}
++
++static void 
++heapify_down(int idx) 
++{
++  int l = 2 * idx + 1;
++  int r = 2 * idx + 2;
++  int min = idx;
++
++  if (l < heap.size &&
++      heap.pages[l]->age < heap.pages[min]->age) {
++    min = l;
++  }
++
++  if (r < heap.size &&
++      heap.pages[r]->age < heap.pages[min]->age) {
++    min = r;
++  }
++
++  if (min != idx) {
++    swap(&heap.pages[idx], &heap.pages[min]);
++    heapify_down(min);
++  }
++}
++
++static struct mempage *
++extract_min() 
++{
++  if (heap.size <= 0) {
++    panic("pageheap: empty heap");
++  }
++
++  struct mempage *root = heap.pages[0];
++  heap.pages[0] = heap.pages[heap.size - 1];
++  heap.size--;
++  heapify_down(0);
++
++  return root;
++}
++
++static void 
++build_heap(void) 
++{
++  for (int i = (heap.size / 2) - 1; i >= 0; i--) {
++    heapify_down(i);
++  }
++}
++
++
++void
++pgheapupdate(void) 
++{
++  build_heap();
++}
++
++void 
++pgheappush(struct mempage *p) 
++{
++  insert(p);
++}
++
++struct mempage *
++pgheappop(void) 
++{
++  struct mempage *p =extract_min();
++  return p;
++}
 diff --git a/kernel/proc.c b/kernel/proc.c
 index 959b778..14d44e8 100644
 --- a/kernel/proc.c
@@ -482,14 +667,15 @@ index 959b778..14d44e8 100644
 +  printf("Total number of swaps: %d\n", swapcount);
  }
 diff --git a/kernel/riscv.h b/kernel/riscv.h
-index 20a01db..fc8a6d0 100644
+index 20a01db..0d86b1d 100644
 --- a/kernel/riscv.h
 +++ b/kernel/riscv.h
-@@ -343,12 +343,16 @@ typedef uint64 *pagetable_t; // 512 PTEs
+@@ -343,12 +343,17 @@ typedef uint64 *pagetable_t; // 512 PTEs
  #define PTE_W (1L << 2)
  #define PTE_X (1L << 3)
  #define PTE_U (1L << 4) // user can access
-+#define PTE_S (1l << 9) // swapped out
++#define PTE_A (1L << 6) // page table access
++#define PTE_S (1L << 9) // swapped out
  
  // shift a physical address to the right place for a PTE.
  #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
@@ -818,10 +1004,29 @@ index 1de184e..9ce23cb 100644
 +  return swapcount;
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
-index 512c850..8dc1a60 100644
+index 512c850..4a1afdd 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
-@@ -65,6 +65,36 @@ usertrap(void)
+@@ -5,12 +5,18 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "page.h"
++#include "param.h"
+ 
+ struct spinlock tickslock;
+ uint ticks;
+ 
+ extern char trampoline[], uservec[], userret[];
+ 
++extern struct mempage pages[];
++extern struct mempage *head;
++extern struct spinlock swlock;
++
+ // in kernelvec.S, calls kerneltrap().
+ void kernelvec();
+ 
+@@ -65,6 +71,36 @@ usertrap(void)
      intr_on();
  
      syscall();
@@ -858,6 +1063,25 @@ index 512c850..8dc1a60 100644
    } else if((which_dev = devintr()) != 0){
      // ok
    } else {
+@@ -160,13 +196,17 @@ kerneltrap()
+   w_sstatus(sstatus);
+ }
+ 
++
+ void
+ clockintr()
+ {
+   acquire(&tickslock);
+   ticks++;
+   wakeup(&ticks);
+-  release(&tickslock);
++  release(&tickslock);  
++#ifdef AGING
++  mempagetick();
++#endif
+ }
+ 
+ // check if it's an external interrupt or software interrupt,
 diff --git a/kernel/vm.c b/kernel/vm.c
 index 9f69783..487bfca 100644
 --- a/kernel/vm.c
