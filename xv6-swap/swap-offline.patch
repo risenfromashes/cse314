@@ -666,15 +666,17 @@ index 0000000..2132971
 +  }
 +}
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index ed65409..57b5c96 100644
+index ed65409..69751e7 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
-@@ -101,31 +101,35 @@ extern uint64 sys_unlink(void);
+@@ -101,31 +101,39 @@ extern uint64 sys_unlink(void);
  extern uint64 sys_link(void);
  extern uint64 sys_mkdir(void);
  extern uint64 sys_close(void);
 +extern uint64 sys_livepgcnt(void);
 +extern uint64 sys_totallivepgcnt(void);
++extern uint64 sys_pgcnt(void);
++extern uint64 sys_swapcnt(void);
  
  // An array mapping syscall numbers from syscall.h
  // to the function that handles the system call.
@@ -723,14 +725,16 @@ index ed65409..57b5c96 100644
 +[SYS_close]          = sys_close,
 +[SYS_livepgcnt]      = sys_livepgcnt,
 +[SYS_totallivepgcnt] = sys_totallivepgcnt,
++[SYS_pgcnt]          = sys_pgcnt,
++[SYS_swapcnt]        = sys_swapcnt,
  };
  
  void
 diff --git a/kernel/syscall.h b/kernel/syscall.h
-index bc5f356..06f1657 100644
+index bc5f356..dd10c0f 100644
 --- a/kernel/syscall.h
 +++ b/kernel/syscall.h
-@@ -1,22 +1,24 @@
+@@ -1,22 +1,26 @@
  // System call numbers
 -#define SYS_fork    1
 -#define SYS_exit    2
@@ -776,16 +780,20 @@ index bc5f356..06f1657 100644
 +#define SYS_close          21
 +#define SYS_livepgcnt      22
 +#define SYS_totallivepgcnt 23
++#define SYS_pgcnt          24
++#define SYS_swapcnt        25
 diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index 1de184e..5ccb1df 100644
+index 1de184e..9ce23cb 100644
 --- a/kernel/sysproc.c
 +++ b/kernel/sysproc.c
-@@ -89,3 +89,18 @@ sys_uptime(void)
+@@ -89,3 +89,33 @@ sys_uptime(void)
    release(&tickslock);
    return xticks;
  }
 +
 +extern uint livepagecount;
++extern uint pagecount;
++extern uint swapcount;
 +
 +uint64
 +sys_livepgcnt(void)
@@ -798,6 +806,19 @@ index 1de184e..5ccb1df 100644
 +sys_totallivepgcnt(void)
 +{
 +  return livepagecount;
++}
++
++
++uint64
++sys_pgcnt(void)
++{
++  return pagecount;
++}
++
++uint64
++sys_swapcnt(void)
++{
++  return swapcount;
 +}
 diff --git a/kernel/trap.c b/kernel/trap.c
 index 512c850..a0f3603 100644
@@ -1077,10 +1098,10 @@ index 384e75f..a0fd173 100644
  print(const char *s)
 diff --git a/user/test1.c b/user/test1.c
 new file mode 100644
-index 0000000..d00e775
+index 0000000..f41015f
 --- /dev/null
 +++ b/user/test1.c
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,75 @@
 +#include "kernel/types.h"
 +#include "user/user.h"
 +
@@ -1094,6 +1115,7 @@ index 0000000..d00e775
 +
 +  int npages = atoi(argv[1]);
 +  void **pages = 0;
++  int init = 101;
 +
 +  if (npages) {
 +    pages = malloc(sizeof(void *) * npages);
@@ -1104,6 +1126,14 @@ index 0000000..d00e775
 +    pages[i] = malloc(4096);
 +    memset(pages[i], 0, 4096);
 +  }
++  for (int i = 0; i < T; i++) {
++    for (int j = 0; j < npages; j++) {
++      int *v = (int *)pages[j];
++      for (int k = 0; k < 4096 / sizeof(int); k++) {
++        v[k] = init;
++      }
++    }
++  }
 +
 +  printf("live pages used by process: %d, pid: %d\n", livepgcnt(), getpid());
 +  printf("total live pages: %d\n", totallivepgcnt());
@@ -1112,8 +1142,7 @@ index 0000000..d00e775
 +    for (int j = 0; j < npages; j++) {
 +      int *v = (int *)pages[j];
 +      for (int k = 0; k < 4096 / sizeof(int); k++) {
-+        v[k] = (v[k] + 1) % 1999;
-+        // printf("%d. accessing page: %p, addr: %p\n", k, pages[i], &v[k]);
++        v[k] = v[k] + init;
 +      }
 +    }
 +  }
@@ -1122,7 +1151,7 @@ index 0000000..d00e775
 +  for (int j = 0; j < npages; j++) {
 +    int *v = (int *)pages[j];
 +    for (int k = 0; k < 4096 / sizeof(int); k++) {
-+      if (v[k] != T) {
++      if (v[k] != (init + T)) {
 +        matched = 0;
 +      }
 +    }
@@ -1133,6 +1162,11 @@ index 0000000..d00e775
 +      free(pages[i]);
 +    }
 +    free(pages);
++  }
++
++  if (swapcnt() + livepgcnt() > pgcnt()) {
++    matched = 0;
++    printf("Pages or swaps not freed\n");
 +  }
 +
 +  if (matched) {
@@ -1146,10 +1180,10 @@ index 0000000..d00e775
 \ No newline at end of file
 diff --git a/user/test2.c b/user/test2.c
 new file mode 100644
-index 0000000..9dc5281
+index 0000000..a39e444
 --- /dev/null
 +++ b/user/test2.c
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,109 @@
 +#include "kernel/types.h"
 +#include "user/user.h"
 +
@@ -1235,6 +1269,12 @@ index 0000000..9dc5281
 +        }
 +      }
 +    }
++
++    if (swapcnt() + livepgcnt() > pgcnt()) {
++      matched = 0;
++      printf("Pages or swaps not freed\n");
++    }
++
 +verdict:
 +    if (matched) {
 +      printf("memory test passed, pid: %d\n", getpid());
@@ -1273,25 +1313,29 @@ index 0000000..fd72d29
 +  return 0;	
 +}
 diff --git a/user/user.h b/user/user.h
-index 4d398d5..9c75a50 100644
+index 4d398d5..bf333c2 100644
 --- a/user/user.h
 +++ b/user/user.h
-@@ -22,6 +22,8 @@ int getpid(void);
+@@ -22,6 +22,10 @@ int getpid(void);
  char* sbrk(int);
  int sleep(int);
  int uptime(void);
 +uint livepgcnt(void);
 +uint totallivepgcnt(void);
++uint pgcnt(void);
++uint swapcnt(void);
  
  // ulib.c
  int stat(const char*, struct stat*);
 diff --git a/user/usys.pl b/user/usys.pl
-index 01e426e..4528dbe 100755
+index 01e426e..df9d7ae 100755
 --- a/user/usys.pl
 +++ b/user/usys.pl
-@@ -36,3 +36,5 @@ entry("getpid");
+@@ -36,3 +36,7 @@ entry("getpid");
  entry("sbrk");
  entry("sleep");
  entry("uptime");
 +entry("livepgcnt");
 +entry("totallivepgcnt");
++entry("pgcnt");
++entry("swapcnt");
