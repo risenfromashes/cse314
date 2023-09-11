@@ -131,10 +131,10 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..ea9a39c
+index 0000000..abf8e1a
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,265 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -384,6 +384,7 @@ index 0000000..ea9a39c
 +	for (p = head; p; p = p->next) {
 +		printf("%d. pa: %p, pte: %p, pt: %p, next: %p\n", i++, p->pa, p->pte, p->pagetable, p->next);
 +	}
++
 +}
 +
 +int
@@ -398,6 +399,7 @@ index 0000000..ea9a39c
 +	release(&swlock);
 +	return 0;
 +}
++
 diff --git a/kernel/proc.c b/kernel/proc.c
 index 959b778..14d44e8 100644
 --- a/kernel/proc.c
@@ -1100,7 +1102,7 @@ index 384e75f..a0fd173 100644
  print(const char *s)
 diff --git a/user/test1.c b/user/test1.c
 new file mode 100644
-index 0000000..f41015f
+index 0000000..a30b667
 --- /dev/null
 +++ b/user/test1.c
 @@ -0,0 +1,75 @@
@@ -1144,7 +1146,7 @@ index 0000000..f41015f
 +    for (int j = 0; j < npages; j++) {
 +      int *v = (int *)pages[j];
 +      for (int k = 0; k < 4096 / sizeof(int); k++) {
-+        v[k] = v[k] + init;
++        v[k] = v[k] + 1;
 +      }
 +    }
 +  }
