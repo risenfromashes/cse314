@@ -493,10 +493,10 @@ index 6624bff..59b7fe8 100644
 +#define AGING              // enable aging page replacement algorithm
 diff --git a/kernel/pgheap.c b/kernel/pgheap.c
 new file mode 100644
-index 0000000..70e3650
+index 0000000..f835d55
 --- /dev/null
 +++ b/kernel/pgheap.c
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,176 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -600,18 +600,21 @@ index 0000000..70e3650
 +}
 +
 +
++/* rebuild heap */
 +void
 +pgheap_update(void) 
 +{
 +  build_heap();
 +}
 +
++/* pop new node to heap */
 +void 
 +pgheap_push(struct mempage *p) 
 +{
 +  insert(p);
 +}
 +
++/* pop minimum age node from heap */
 +struct mempage *
 +pgheap_pop(void) 
 +{
@@ -619,6 +622,7 @@ index 0000000..70e3650
 +  return p;
 +}
 +
++/* remove heap node */
 +void
 +pgheap_remove_node(struct mempage *p)
 +{
@@ -632,6 +636,7 @@ index 0000000..70e3650
 +  }
 +}
 +
++/* remove heap nodes by @param pagetable */
 +void
 +pgheap_remove_nodes(pagetable_t pagetable)
 +{
@@ -645,6 +650,7 @@ index 0000000..70e3650
 +  build_heap();
 +}
 +
++/* print bits in msb first order */
 +static void
 +print_bits(uint64 v) {
 +	for(int i = 63; i >= 0; i--) {
@@ -656,6 +662,7 @@ index 0000000..70e3650
 +	}
 +}
 +
++/* dump heap status for debugging */
 +void 
 +pgheap_dump(void) 
 +{
