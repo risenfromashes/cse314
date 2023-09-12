@@ -129,10 +129,10 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..3b2ad7e
+index 0000000..e82a555
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,331 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -202,12 +202,14 @@ index 0000000..3b2ad7e
 +
 +	acquire(&swlock);
 +	if (free) {
++		/* there is a free mempage node, use it */
 +		p = free;
 +		free = free->next;
 +
 +		if (p->pa == NULL) {
-+			// not yet allocated, allocate now
++			/* hasn't yet been allcoated */
 +			if ((p->pa = kalloc()) == 0) {
++				/* out of memory, nothing to do */
 +				free = p;
 +				release(&swlock);
 +				return NULL;
@@ -218,28 +220,36 @@ index 0000000..3b2ad7e
 +		release(&swlock);
 +	} else {
 +
-+		/* allocate new swap */
-+		struct swap *sw = swapalloc();
-+
 +		if (!head) {
-+			panic("allocmempage: no page in linked list");
++			release(&swlock);
++			return NULL;
 +		}
 +
++		/* allocate new swap to swap out to */
++		struct swap *sw = swapalloc();
++
++
 +		/* need to swap out a page */
++		/* use different policy according to param.h */
 +#ifdef AGING
 +		p = pgheap_pop();
 +#else
 +		p = head;
 +#endif
++		/* unlink node from linked list */
 +		unlinkmempagenode(p);
 +
 +		release(&swlock);
++
++		/* need to release all locks before swapping out */
 +		swapout(sw, p->pa);
 +
 +		int flags = PTE_FLAGS(*p->pte);
 +		*(p->pte) = (SW2PTE(sw) | flags | PTE_S) & ~(PTE_V);
 +	}
 +	
++	/* lock not held, and p is in neither list
++	 * therefore, p cannot be swapped out by another call */
 +	if (oldsw) {
 +		swapin(p->pa, oldsw);
 +		swapfree(oldsw);
@@ -248,7 +258,7 @@ index 0000000..3b2ad7e
 +		__sync_fetch_and_add(&pagecount, 1);
 +	}
 +
-+	/* reacquire lock: mempage was in neither list when lock was released, so wasn't be swapped out */
++	/* reacquire lock before modifiying lists */
 +	acquire(&swlock);
 +
 +	/* push to the end of queue */
@@ -260,18 +270,22 @@ index 0000000..3b2ad7e
 +	p->next = NULL;
 +	p->age = 0;
 +
-+#ifdef AGING
-+	p->age = INIT_AGE;
-+	pgheap_push(p);
-+#endif	
 +
 +	if (tail) {
 +		tail->next = p;
 +	}
 +	tail = p;
 +	
++	/* add to heap if AGING policy is used */
++#ifdef AGING
++	p->age = INIT_AGE;
++	pgheap_push(p);
++#endif	
++
++	/* update mapping */
 +	*pte = (PA2PTE(p->pa) | flags | PTE_V) & ~(PTE_S);
 +
++	/* remember associated pte and pagetable */
 +	p->pte = pte;
 +	p->pagetable = pagetable;
 +
@@ -293,9 +307,9 @@ index 0000000..3b2ad7e
 +		panic("Swapped out page in alive pages list");
 +	}
 +
-+	/* unmap pagetable entry */
-+	/* but keep flags to avoid panics */
-+	/* leave it to uvmunmap to clear flags */
++	/* unmap pagetable entry
++	 * but keep flags to avoid panics
++	 * leave it to uvmunmap to clear flags */
 +	*pte = flags;
 +
 +	/* remove linked list node */
@@ -319,7 +333,9 @@ index 0000000..3b2ad7e
 +{
 +	acquire(&swlock);
 +
++#ifdef AGING
 +	pgheap_remove_node(p);
++#endif
 +
 +	_freemempagenode(p);
 +
@@ -346,7 +362,9 @@ index 0000000..3b2ad7e
 +		next = p->next;
 +		if (p->pte == pte) {
 +
++#ifdef AGING
 +			pgheap_remove_node(p);
++#endif
 +
 +			_freemempagenode(p);
 +			break;
@@ -359,19 +377,20 @@ index 0000000..3b2ad7e
 +void 
 +freemempages(pagetable_t pagetable)
 +{
-+	int count = 0;
 +
 +	struct mempage *p, *next;
 +
 +	acquire(&swlock);
 +
++#ifdef AGING
 +	pgheap_remove_nodes(pagetable);
++#endif
++
 +	/* free all the mempage with given pagetable */
 +	for (p = head; p; p = next) {
 +		next = p->next;
 +		if (p->pagetable == pagetable) {
 +			_freemempagenode(p);
-+			count++;
 +		} 	
 +	}
 +	release(&swlock);
@@ -412,7 +431,7 @@ index 0000000..3b2ad7e
 +
 +}
 +
-+/* copies data from pa to dst, if pte still holds pa after acquire lock 
++/* copies data from pa to dst, if pte still holds pa after acquiring lock 
 + * this is to ensure that source page isn't swapped out before memmove operation finishes */
 +int
 +mempagesafecopy(pte_t *pte, uint64 pa, char *dst) 
@@ -474,10 +493,10 @@ index 6624bff..59b7fe8 100644
 +#define AGING              // enable aging page replacement algorithm
 diff --git a/kernel/pgheap.c b/kernel/pgheap.c
 new file mode 100644
-index 0000000..c74f5b0
+index 0000000..70e3650
 --- /dev/null
 +++ b/kernel/pgheap.c
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,169 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -494,6 +513,8 @@ index 0000000..c74f5b0
 +  uint size;
 +} heap;
 +
++
++/*** binary heap implementation following CLRS ***/
 +static void 
 +swap(struct mempage **a, struct mempage **b) 
 +{
