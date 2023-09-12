@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 39a99d7..8de562a 100644
+index 39a99d7..c7fb16a 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -24,6 +24,9 @@ OBJS = \
@@ -12,26 +12,15 @@ index 39a99d7..8de562a 100644
    $K/exec.o \
    $K/sysfile.o \
    $K/kernelvec.o \
-@@ -132,6 +135,10 @@ UPROGS=\
+@@ -132,6 +135,8 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
 +	$U/_test1\
 +	$U/_test2\
-+	$U/_test3\
-+	$U/_test4\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -153,7 +160,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
- 	then echo "-gdb tcp::$(GDBPORT)"; \
- 	else echo "-s -p $(GDBPORT)"; fi)
- ifndef CPUS
--CPUS := 3
-+CPUS := 1
- endif
- 
- QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
 diff --git a/compile_flags.txt b/compile_flags.txt
 new file mode 100644
 index 0000000..57dc239
@@ -41,7 +30,7 @@ index 0000000..57dc239
 +-I.
 \ No newline at end of file
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..b1e6443 100644
+index a3c962b..5706a03 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -8,6 +8,8 @@ struct spinlock;
@@ -77,26 +66,28 @@ index a3c962b..b1e6443 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
  
-@@ -185,5 +197,23 @@ void            virtio_disk_init(void);
+@@ -185,5 +197,25 @@ void            virtio_disk_init(void);
  void            virtio_disk_rw(struct buf *, int);
  void            virtio_disk_intr(void);
  
 +// page.c
 +void            mempageinit();
-+void *          mempageaddr(struct mempage *);
 +struct mempage *allocmempage(pagetable_t, pte_t *, int, struct swap *);
 +void            freemempagenode(struct mempage *);
 +void            freemempage(pte_t *pte);
 +void            freemempages(pagetable_t);
 +uint            countmempages();
 +void            mempagedump();
-+int             mempagecopy(pte_t *, uint64, char *);
++int             mempagesafecopy(pte_t *, uint64, char *);
 +void            mempagetick(void);
 +
 +//pgheap.c
-+void            pgheapupdate(void);
-+void            pgheappush(struct mempage *p);
-+struct mempage *pgheappop(void);
++void            pgheap_update(void);
++void            pgheap_push(struct mempage *p);
++struct mempage *pgheap_pop(void);
++void            pgheap_remove_node(struct mempage *p);
++void            pgheap_remove_nodes(pagetable_t);
++void            pgheap_dump(void);
 +
 +
  // number of elements in fixed-size array
@@ -138,10 +129,10 @@ index f0d3171..66e5b44 100644
      trapinithart();  // install kernel trap vector
 diff --git a/kernel/page.c b/kernel/page.c
 new file mode 100644
-index 0000000..6ad23af
+index 0000000..3b2ad7e
 --- /dev/null
 +++ b/kernel/page.c
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,312 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -166,6 +157,7 @@ index 0000000..6ad23af
 +uint livepagecount = 0;
 +extern uint pagecount;
 +
++/* unlink linked list node */
 +static void
 +unlinkmempagenode(struct mempage *p) 
 +{
@@ -181,6 +173,7 @@ index 0000000..6ad23af
 +	}
 +}
 +
++/* initialise linked list queue and freelist */
 +void 
 +mempageinit() 
 +{
@@ -197,8 +190,11 @@ index 0000000..6ad23af
 +}
 +
 +
-+/* allocate an in-memory page and map it to va
-+ return 0 on success -1 on failure */
++/* allocate an in-memory page by swapping out a page if neccessary
++ * @param pagetable: stored for bookkeeping
++ * @param pte: updated to point to allocated mempage's physical address
++ * @param flags: used to update pte
++ * @param oldw: if provided, page is swapped in from this swap */
 +struct mempage*
 +allocmempage(pagetable_t pagetable, pte_t *pte, int flags, struct swap *oldsw) 
 +{
@@ -219,6 +215,7 @@ index 0000000..6ad23af
 +		}
 +
 +		__sync_fetch_and_add(&livepagecount, 1);
++		release(&swlock);
 +	} else {
 +
 +		/* allocate new swap */
@@ -230,21 +227,29 @@ index 0000000..6ad23af
 +
 +		/* need to swap out a page */
 +#ifdef AGING
-+		p = pgheappop();
++		p = pgheap_pop();
 +#else
 +		p = head;
 +#endif
-+
 +		unlinkmempagenode(p);
 +
 +		release(&swlock);
 +		swapout(sw, p->pa);
-+		acquire(&swlock);
 +
 +		int flags = PTE_FLAGS(*p->pte);
 +		*(p->pte) = (SW2PTE(sw) | flags | PTE_S) & ~(PTE_V);
-+
 +	}
++	
++	if (oldsw) {
++		swapin(p->pa, oldsw);
++		swapfree(oldsw);
++	} else {
++		memset(p->pa, 0, PGSIZE);
++		__sync_fetch_and_add(&pagecount, 1);
++	}
++
++	/* reacquire lock: mempage was in neither list when lock was released, so wasn't be swapped out */
++	acquire(&swlock);
 +
 +	/* push to the end of queue */
 +	if (!head) {
@@ -257,7 +262,7 @@ index 0000000..6ad23af
 +
 +#ifdef AGING
 +	p->age = INIT_AGE;
-+	pgheappush(p);
++	pgheap_push(p);
 +#endif	
 +
 +	if (tail) {
@@ -273,24 +278,11 @@ index 0000000..6ad23af
 +	
 +	release(&swlock);
 +
-+	memset(p->pa, 1, PGSIZE);
-+
-+	if (oldsw) {
-+		swapin(p->pa, oldsw);
-+		swapfree(oldsw);
-+	} else {
-+		__sync_fetch_and_add(&pagecount, 1);
-+	}
-+
 +	return p;
 +}
 +
-+void *
-+mempageaddr(struct mempage *p)
-+{
-+	return p->pa;
-+}
 +
++/* free mempage node, without locking */
 +static void
 +_freemempagenode(struct mempage *p) 
 +{
@@ -321,15 +313,20 @@ index 0000000..6ad23af
 +	__sync_fetch_and_add(&pagecount, -1);
 +}
 +
++/* free mempage node, by pointer */
 +void 
 +freemempagenode(struct mempage *p)
 +{
 +	acquire(&swlock);
++
++	pgheap_remove_node(p);
++
 +	_freemempagenode(p);
++
 +	release(&swlock);
 +}
 +
-+/* free mempage struct holding pte */
++/* free mempage node, by @param pte */
 +void 
 +freemempage(pte_t *pte)
 +{
@@ -348,6 +345,9 @@ index 0000000..6ad23af
 +	for (p = head; p; p = next) {
 +		next = p->next;
 +		if (p->pte == pte) {
++
++			pgheap_remove_node(p);
++
 +			_freemempagenode(p);
 +			break;
 +		} 	
@@ -355,24 +355,29 @@ index 0000000..6ad23af
 +	release(&swlock);
 +}
 +
-+/* free mempage struct holding pagetable */
++/* free mempage node, by matching @param pagetable */
 +void 
 +freemempages(pagetable_t pagetable)
 +{
++	int count = 0;
++
 +	struct mempage *p, *next;
 +
 +	acquire(&swlock);
++
++	pgheap_remove_nodes(pagetable);
 +	/* free all the mempage with given pagetable */
 +	for (p = head; p; p = next) {
 +		next = p->next;
 +		if (p->pagetable == pagetable) {
 +			_freemempagenode(p);
++			count++;
 +		} 	
 +	}
 +	release(&swlock);
 +}
 +
-+
++/* count mempages held by current process */
 +uint
 +countmempages() 
 +{
@@ -392,6 +397,7 @@ index 0000000..6ad23af
 +	return count;
 +}
 +
++/* dump linked list for debugging */
 +void
 +mempagedump() 
 +{
@@ -406,8 +412,10 @@ index 0000000..6ad23af
 +
 +}
 +
++/* copies data from pa to dst, if pte still holds pa after acquire lock 
++ * this is to ensure that source page isn't swapped out before memmove operation finishes */
 +int
-+mempagecopy(pte_t *pte, uint64 pa, char *dst) 
++mempagesafecopy(pte_t *pte, uint64 pa, char *dst) 
 +{
 +	acquire(&swlock);
 +	if (PTE2PA(*pte) != pa) {
@@ -419,22 +427,24 @@ index 0000000..6ad23af
 +	return 0;
 +}
 +
-+
-+// called on each clock tick
++/* called on each clock tick
++ * updates age of each live page */
 +void
 +mempagetick(void) 
 +{
 +  acquire(&swlock);
 +  for (struct mempage *p = head; p; p = p->next) {
 +		// check if accessed in this clock tick
-+    int accessed = *(p->pte) & PTE_A;
++    int accessed = (*(p->pte) & PTE_A) != 0;
 +    p->age = INC_AGE(p->age, accessed);
 +		// reset flag
 +		*(p->pte) &= ~(PTE_A);
 +  }
-+  pgheapupdate();
++  pgheap_update();
 +  release(&swlock);
 +}
++
++
 diff --git a/kernel/page.h b/kernel/page.h
 new file mode 100644
 index 0000000..a7928e4
@@ -464,10 +474,10 @@ index 6624bff..59b7fe8 100644
 +#define AGING              // enable aging page replacement algorithm
 diff --git a/kernel/pgheap.c b/kernel/pgheap.c
 new file mode 100644
-index 0000000..82358e2
+index 0000000..c74f5b0
 --- /dev/null
 +++ b/kernel/pgheap.c
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,167 @@
 +#include "stddef.h"
 +#include "types.h"
 +#include "param.h"
@@ -507,6 +517,8 @@ index 0000000..82358e2
 +    heapify_up(p);
 +  }
 +}
++
++extern uint livepagecount;
 +
 +static void 
 +insert(struct mempage *p) 
@@ -568,25 +580,73 @@ index 0000000..82358e2
 +
 +
 +void
-+pgheapupdate(void) 
++pgheap_update(void) 
 +{
 +  build_heap();
 +}
 +
 +void 
-+pgheappush(struct mempage *p) 
++pgheap_push(struct mempage *p) 
 +{
 +  insert(p);
 +}
 +
 +struct mempage *
-+pgheappop(void) 
++pgheap_pop(void) 
 +{
 +  struct mempage *p =extract_min();
 +  return p;
 +}
++
++void
++pgheap_remove_node(struct mempage *p)
++{
++  for (uint i = 0; i < heap.size; i++) {
++    if (heap.pages[i] == p) {
++      heap.pages[i] = heap.pages[heap.size - 1];
++      heapify_down(i);
++      heap.size--;
++      break;
++    }
++  }
++}
++
++void
++pgheap_remove_nodes(pagetable_t pagetable)
++{
++  for (uint i = 0; i < heap.size; i++) {
++    if (heap.pages[i]->pagetable == pagetable) {
++      heap.pages[i] = heap.pages[heap.size - 1];
++      heap.size--;
++      i--;
++    }
++  }
++  build_heap();
++}
++
++static void
++print_bits(uint64 v) {
++	for(int i = 63; i >= 0; i--) {
++		if (v & (1L << i)) {
++			printf("1");
++		} else {
++			printf("0");
++		}
++	}
++}
++
++void 
++pgheap_dump(void) 
++{
++  printf("heap size: %d\n", heap.size);
++  for (uint i = 0; i < heap.size; i++) {
++    printf("%d. mempage: %p, age: ", i + 1, heap.pages[i]);
++    print_bits(heap.pages[i]->age);
++    printf("\n");
++  }
++}
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 959b778..14d44e8 100644
+index 959b778..1c50742 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -158,8 +158,6 @@ freeproc(struct proc *p)
@@ -645,7 +705,7 @@ index 959b778..14d44e8 100644
            return pid;
          }
          release(&pp->lock);
-@@ -652,6 +660,10 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+@@ -652,6 +660,11 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
    }
  }
  
@@ -653,10 +713,11 @@ index 959b778..14d44e8 100644
 +extern uint pagecount;
 +extern uint swapcount;
 +
++
  // Print a process listing to console.  For debugging.
  // Runs when user types ^P on console.
  // No lock to avoid wedging a stuck machine further.
-@@ -680,4 +692,9 @@ procdump(void)
+@@ -680,4 +693,11 @@ procdump(void)
      printf("%d %s %s", p->pid, state, p->name);
      printf("\n");
    }
@@ -665,6 +726,8 @@ index 959b778..14d44e8 100644
 +  printf("Total number of alive pages: %d\n", livepagecount);
 +  printf("Total number of pages: %d\n", pagecount);
 +  printf("Total number of swaps: %d\n", swapcount);
++
++  pgheap_dump();
  }
 diff --git a/kernel/riscv.h b/kernel/riscv.h
 index 20a01db..0d86b1d 100644
@@ -1083,18 +1146,19 @@ index 512c850..4a1afdd 100644
  
  // check if it's an external interrupt or software interrupt,
 diff --git a/kernel/vm.c b/kernel/vm.c
-index 9f69783..487bfca 100644
+index 9f69783..d215db3 100644
 --- a/kernel/vm.c
 +++ b/kernel/vm.c
-@@ -5,6 +5,7 @@
+@@ -5,6 +5,8 @@
  #include "riscv.h"
  #include "defs.h"
  #include "fs.h"
 +#include "stddef.h"
++#include "page.h"
  
  /*
   * the kernel's page table.
-@@ -15,6 +16,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
+@@ -15,6 +17,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
  
  extern char trampoline[]; // trampoline.S
  
@@ -1103,7 +1167,7 @@ index 9f69783..487bfca 100644
  // Make a direct-map page table for the kernel.
  pagetable_t
  kvmmake(void)
-@@ -135,6 +138,27 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+@@ -135,6 +139,27 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
      panic("kvmmap");
  }
  
@@ -1131,7 +1195,7 @@ index 9f69783..487bfca 100644
  // Create PTEs for virtual addresses starting at va that refer to
  // physical addresses starting at pa. va and size might not
  // be page-aligned. Returns 0 on success, -1 if walk() couldn't
-@@ -179,13 +203,22 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+@@ -179,13 +204,22 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
    for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
      if((pte = walk(pagetable, a, 0)) == 0)
        panic("uvmunmap: walk");
@@ -1157,7 +1221,7 @@ index 9f69783..487bfca 100644
      }
      *pte = 0;
    }
-@@ -210,13 +243,20 @@ uvmcreate()
+@@ -210,13 +244,20 @@ uvmcreate()
  void
  uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  {
@@ -1174,14 +1238,14 @@ index 9f69783..487bfca 100644
 +    panic("uvmfirst: couldn't allocate mempage");
 +  }
 +
-+  char *mem = mempageaddr(p);
++  char *mem = p->pa;
 +
    memset(mem, 0, PGSIZE);
 -  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
    memmove(mem, src, sz);
  }
  
-@@ -225,7 +265,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+@@ -225,7 +266,6 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
  uint64
  uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  {
@@ -1189,7 +1253,7 @@ index 9f69783..487bfca 100644
    uint64 a;
  
    if(newsz < oldsz)
-@@ -233,17 +272,18 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+@@ -233,17 +273,17 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
  
    oldsz = PGROUNDUP(oldsz);
    for(a = oldsz; a < newsz; a += PGSIZE){
@@ -1210,7 +1274,6 @@ index 9f69783..487bfca 100644
        return 0;
 -    }
 +    } 
-+    memset(mempageaddr(p), 0, PGSIZE);
    }
    return newsz;
  }
@@ -1267,7 +1330,7 @@ index 9f69783..487bfca 100644
 +      if((p = allocmempage(new, new_pte, flags, NULL)) == 0)
 +        goto err;
 +
-+      if (mempagecopy(pte, pa, mempageaddr(p)) != 0) {
++      if (mempagesafecopy(pte, pa, p->pa) != 0) {
 +        freemempagenode(p);
 +        struct swap *s = (struct swap *)PTE2SW(*pte);
 +        *new_pte = *pte;
@@ -1522,24 +1585,6 @@ index 0000000..a39e444
 +  return 0;
 +}
 \ No newline at end of file
-diff --git a/user/test3.c b/user/test3.c
-new file mode 100644
-index 0000000..fd72d29
---- /dev/null
-+++ b/user/test3.c
-@@ -0,0 +1,3 @@
-+int main() {
-+  return 0;	
-+}
-diff --git a/user/test4.c b/user/test4.c
-new file mode 100644
-index 0000000..fd72d29
---- /dev/null
-+++ b/user/test4.c
-@@ -0,0 +1,3 @@
-+int main() {
-+  return 0;	
-+}
 diff --git a/user/user.h b/user/user.h
 index 4d398d5..bf333c2 100644
 --- a/user/user.h
